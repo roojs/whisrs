@@ -3,7 +3,7 @@
 //! On mid-stream failure, raw PCM audio is saved as WAV files in
 //! `~/.cache/whisrs/recovery/` so users can retry transcription manually.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use tracing::{info, warn};
@@ -22,12 +22,15 @@ pub fn recovery_dir() -> PathBuf {
 ///
 /// Returns the path to the saved file on success.
 pub fn save_recovery_audio(samples: &[i16]) -> anyhow::Result<PathBuf> {
+    save_recovery_audio_to(&recovery_dir(), samples)
+}
+
+fn save_recovery_audio_to(dir: &Path, samples: &[i16]) -> anyhow::Result<PathBuf> {
     if samples.is_empty() {
         anyhow::bail!("no audio samples to save for recovery");
     }
 
-    let dir = recovery_dir();
-    std::fs::create_dir_all(&dir)
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create recovery directory: {}", dir.display()))?;
 
     let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S");
@@ -109,17 +112,14 @@ mod tests {
 
     #[test]
     fn save_and_read_recovery_audio() {
+        let dir = tempfile::tempdir().unwrap();
         let samples: Vec<i16> = (0..1600).map(|i| (i % 256) as i16).collect();
-        let path = save_recovery_audio(&samples).unwrap();
+        let path = save_recovery_audio_to(dir.path(), &samples).unwrap();
 
-        // Verify the file exists and is a valid WAV.
         assert!(path.exists());
         let cursor = std::io::Cursor::new(std::fs::read(&path).unwrap());
         let reader = hound::WavReader::new(cursor).unwrap();
         let read_samples: Vec<i16> = reader.into_samples::<i16>().map(|s| s.unwrap()).collect();
         assert_eq!(read_samples, samples);
-
-        // Clean up.
-        std::fs::remove_file(&path).ok();
     }
 }
