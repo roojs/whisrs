@@ -22,6 +22,14 @@ test the microphone, and write
 .IR config.toml .
 Does not require the daemon to be running.
 .TP
+.B config
+Open an interactive menu to edit any section of
+.IR config.toml
+\(em backend, language, hotkeys, overlay, command-mode LLM, and more.
+On save, writes the file and restarts the daemon via systemd. Unlike
+.B setup
+this does not touch udev rules, the systemd unit, or compositor keybindings.
+.TP
 .B toggle
 Start or stop recording. If idle, begins audio capture. If recording,
 stops capture and sends audio for transcription. Text is typed at the

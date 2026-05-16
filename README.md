@@ -189,6 +189,7 @@ For the full reference (overlay, `[input]`, `[asr-sidecar]`, `[llm]`, `[hotkeys]
 
 ```
 whisrs setup     # Interactive onboarding
+whisrs config    # Interactive editor for ~/.config/whisrs/config.toml
 whisrs toggle    # Start/stop recording
 whisrs cancel    # Cancel recording, discard audio
 whisrs status    # Query daemon state

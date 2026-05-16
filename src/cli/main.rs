@@ -1,12 +1,14 @@
 use std::process;
-use std::process::Command as StdCommand;
 
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use whisrs::history::HistoryEntry;
-use whisrs::{encode_message, read_message, socket_path, Command, Response, State};
+use whisrs::{
+    encode_message, read_message, restart_daemon_via_systemd, socket_path, Command, Response,
+    RestartOutcome, State,
+};
 
 const ASCII_BANNER: &str = concat!(
     "\n",
@@ -43,6 +45,8 @@ struct Cli {
 enum SubCmd {
     /// Interactive onboarding — pick a backend, set API key, test microphone
     Setup,
+    /// Edit any part of ~/.config/whisrs/config.toml; restarts the daemon on save
+    Config,
     /// Toggle recording on/off (start dictation or stop and transcribe)
     Toggle,
     /// Cancel the current recording and discard audio
@@ -98,6 +102,16 @@ async fn main() -> anyhow::Result<()> {
                 process::exit(1);
             }
         }
+        SubCmd::Config => {
+            if let Err(e) = whisrs::config::edit::run_config_menu() {
+                if is_tty() {
+                    eprintln!("{RED}config failed:{RESET} {e:#}");
+                } else {
+                    eprintln!("config failed: {e:#}");
+                }
+                process::exit(1);
+            }
+        }
         SubCmd::Toggle => {
             send_command(Command::Toggle).await?;
         }
@@ -134,18 +148,22 @@ async fn main() -> anyhow::Result<()> {
 fn cmd_restart() -> anyhow::Result<()> {
     let use_color = is_tty();
 
-    if has_systemd_unit() {
-        if use_color {
-            println!("{BOLD}Restarting whisrs daemon (systemd)…{RESET}");
-        } else {
-            println!("Restarting whisrs daemon (systemd)…");
+    if use_color {
+        println!("{BOLD}Restarting whisrs daemon (systemd)…{RESET}");
+    } else {
+        println!("Restarting whisrs daemon (systemd)…");
+    }
+
+    match restart_daemon_via_systemd() {
+        RestartOutcome::Restarted => {
+            if use_color {
+                println!("{GREEN}Daemon restarted.{RESET}");
+            } else {
+                println!("Daemon restarted.");
+            }
+            Ok(())
         }
-
-        let status = StdCommand::new("systemctl")
-            .args(["--user", "restart", "whisrs.service"])
-            .status()?;
-
-        if !status.success() {
+        RestartOutcome::Failed => {
             if use_color {
                 eprintln!("{RED}systemctl --user restart whisrs.service failed.{RESET}");
             } else {
@@ -153,63 +171,29 @@ fn cmd_restart() -> anyhow::Result<()> {
             }
             process::exit(1);
         }
-
-        if use_color {
-            println!("{GREEN}Daemon restarted.{RESET}");
-        } else {
-            println!("Daemon restarted.");
+        RestartOutcome::NoSystemdUnit => {
+            if use_color {
+                eprintln!(
+                    "{YELLOW}No whisrs systemd user unit detected.{RESET}\n\
+                     \n\
+                     Install the systemd unit (run `whisrs setup` and accept the systemd step),\n\
+                     or restart the daemon manually:\n\
+                     \n\
+                     \x20 pkill whisrsd; sleep 0.2; whisrsd &"
+                );
+            } else {
+                eprintln!(
+                    "No whisrs systemd user unit detected.\n\
+                     \n\
+                     Install the systemd unit (run `whisrs setup` and accept the systemd step),\n\
+                     or restart the daemon manually:\n\
+                     \n\
+                     \x20 pkill whisrsd; sleep 0.2; whisrsd &"
+                );
+            }
+            process::exit(1);
         }
-        return Ok(());
     }
-
-    if use_color {
-        eprintln!(
-            "{YELLOW}No whisrs systemd user unit detected.{RESET}\n\
-             \n\
-             Install the systemd unit (run `whisrs setup` and accept the systemd step),\n\
-             or restart the daemon manually:\n\
-             \n\
-             \x20 pkill whisrsd; sleep 0.2; whisrsd &"
-        );
-    } else {
-        eprintln!(
-            "No whisrs systemd user unit detected.\n\
-             \n\
-             Install the systemd unit (run `whisrs setup` and accept the systemd step),\n\
-             or restart the daemon manually:\n\
-             \n\
-             \x20 pkill whisrsd; sleep 0.2; whisrsd &"
-        );
-    }
-    process::exit(1);
-}
-
-/// Returns `true` when `whisrs.service` is loaded as a user unit.
-fn has_systemd_unit() -> bool {
-    // `is-enabled` exits 0 for enabled/static/linked units and non-zero when
-    // the unit isn't loaded. It works whether the service is currently active
-    // or not, which matches `whisrs restart`'s "start or restart" semantics.
-    let Ok(output) = StdCommand::new("systemctl")
-        .args(["--user", "is-enabled", "whisrs.service"])
-        .output()
-    else {
-        return false;
-    };
-
-    if output.status.success() {
-        return true;
-    }
-
-    // Fall back to `list-unit-files` for the static/linked case where
-    // `is-enabled` may exit non-zero on some distros.
-    let Ok(output) = StdCommand::new("systemctl")
-        .args(["--user", "list-unit-files", "whisrs.service"])
-        .output()
-    else {
-        return false;
-    };
-
-    output.status.success() && String::from_utf8_lossy(&output.stdout).contains("whisrs.service")
 }
 
 /// Connect to the daemon and send a command, printing the response.

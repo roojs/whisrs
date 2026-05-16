@@ -18,15 +18,15 @@ use crate::{
 };
 
 // ANSI color codes.
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
+pub(crate) const GREEN: &str = "\x1b[32m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
+pub(crate) const RED: &str = "\x1b[31m";
+pub(crate) const BOLD: &str = "\x1b[1m";
+pub(crate) const DIM: &str = "\x1b[2m";
+pub(crate) const RESET: &str = "\x1b[0m";
 
 /// Backend choices presented to the user.
-const BACKEND_CHOICES: &[&str] = &[
+pub(crate) const BACKEND_CHOICES: &[&str] = &[
     "Groq               (free, fast, cloud)",
     "Deepgram Streaming (free credits, true streaming, cloud)",
     "Deepgram REST      (free credits, simple, cloud)",
@@ -37,7 +37,7 @@ const BACKEND_CHOICES: &[&str] = &[
 ];
 
 /// Map selection index to backend string used in config.
-const BACKEND_VALUES: &[&str] = &[
+pub(crate) const BACKEND_VALUES: &[&str] = &[
     "groq",
     "deepgram-streaming",
     "deepgram",
@@ -48,15 +48,15 @@ const BACKEND_VALUES: &[&str] = &[
 ];
 
 /// Whisper model choices (name, file size, description).
-const WHISPER_MODEL_CHOICES: &[&str] = &[
+pub(crate) const WHISPER_MODEL_CHOICES: &[&str] = &[
     "tiny.en    (75 MB,  decent accuracy, very fast)",
     "base.en    (142 MB, good accuracy, real-time)  <- recommended",
     "small.en   (466 MB, very good accuracy, slower)",
 ];
-const WHISPER_MODEL_NAMES: &[&str] = &["tiny.en", "base.en", "small.en"];
+pub(crate) const WHISPER_MODEL_NAMES: &[&str] = &["tiny.en", "base.en", "small.en"];
 
 /// Try to load an existing config from disk.
-fn load_existing_config() -> Option<Config> {
+pub(crate) fn load_existing_config() -> Option<Config> {
     let path = crate::config_path();
     if !path.exists() {
         return None;
@@ -66,7 +66,7 @@ fn load_existing_config() -> Option<Config> {
 }
 
 /// Mask an API key for display, showing only the last 4 characters.
-fn mask_api_key(key: &str) -> String {
+pub(crate) fn mask_api_key(key: &str) -> String {
     if key.len() <= 4 {
         "****".to_string()
     } else {
@@ -176,7 +176,7 @@ pub fn run_setup() -> Result<()> {
 }
 
 /// Prompt the user to select a transcription backend.
-fn select_backend(existing: Option<&Config>) -> Result<String> {
+pub(crate) fn select_backend(existing: Option<&Config>) -> Result<String> {
     // Determine the default index based on existing config.
     let default_idx = existing
         .map(|cfg| {
@@ -245,7 +245,7 @@ fn select_local_engine() -> Result<String> {
 
 /// Configure the selected backend (API key or model path).
 #[allow(clippy::type_complexity)]
-fn configure_backend(
+pub(crate) fn configure_backend(
     backend: &str,
     existing: Option<&Config>,
 ) -> Result<(
@@ -484,7 +484,7 @@ fn download_whisper_model(model_name: &str, model_dir: &std::path::Path) -> Resu
 }
 
 /// Prompt for an API key, offering to keep the existing one if present.
-fn prompt_api_key_with_existing(
+pub(crate) fn prompt_api_key_with_existing(
     prompt: &str,
     hint: &str,
     existing_key: Option<&String>,
@@ -517,7 +517,7 @@ fn prompt_api_key_with_existing(
 }
 
 /// Common languages with their ISO 639-1 codes.
-const LANGUAGE_CHOICES: &[(&str, &str)] = &[
+pub(crate) const LANGUAGE_CHOICES: &[(&str, &str)] = &[
     ("en", "English"),
     ("auto", "Auto-detect"),
     ("es", "Spanish"),
@@ -539,7 +539,7 @@ const LANGUAGE_CHOICES: &[(&str, &str)] = &[
 ];
 
 /// Ask the user for their preferred language.
-fn select_language(existing: Option<&Config>) -> Result<String> {
+pub(crate) fn select_language(existing: Option<&Config>) -> Result<String> {
     let default_lang = existing
         .map(|c| c.general.language.clone())
         .unwrap_or_else(|| "en".to_string());
@@ -631,7 +631,7 @@ fn test_microphone() {
 }
 
 /// Write the config to `~/.config/whisrs/config.toml` with `chmod 0600`.
-fn write_config(config: &Config) -> Result<PathBuf> {
+pub(crate) fn write_config(config: &Config) -> Result<PathBuf> {
     let config_path = crate::config_path();
     let config_dir = config_path
         .parent()
@@ -1166,7 +1166,7 @@ fn configure_overlay() -> (bool, Option<crate::OverlayConfig>) {
 
 /// Theme picker for the overlay. Always returns a named theme — "custom" is
 /// left for power users to set in config.toml.
-fn pick_overlay_theme() -> String {
+pub(crate) fn pick_overlay_theme() -> String {
     println!();
     let selection = Select::new()
         .with_prompt("Pick an overlay theme")
@@ -1279,7 +1279,7 @@ fn offer_install_gnome_extension() {
 }
 
 /// LLM provider choices for command mode.
-const LLM_PROVIDER_CHOICES: &[&str] = &[
+pub(crate) const LLM_PROVIDER_CHOICES: &[&str] = &[
     "OpenAI         (recommended)",
     "Groq           (fast, free tier)",
     "OpenRouter     (many models, free options)",
@@ -1288,7 +1288,7 @@ const LLM_PROVIDER_CHOICES: &[&str] = &[
 ];
 
 /// LLM provider API URLs.
-const LLM_PROVIDER_URLS: &[&str] = &[
+pub(crate) const LLM_PROVIDER_URLS: &[&str] = &[
     "https://api.openai.com/v1/chat/completions",
     "https://api.groq.com/openai/v1/chat/completions",
     "https://openrouter.ai/api/v1/chat/completions",
@@ -1379,7 +1379,7 @@ const GEMINI_MODELS: &[(&str, &str)] = &[
 ];
 
 /// Configure the LLM for command mode (optional).
-fn configure_llm() -> Result<Option<LlmConfig>> {
+pub(crate) fn configure_llm() -> Result<Option<LlmConfig>> {
     println!("\n{BOLD}Command mode (optional)...{RESET}");
     println!("  {DIM}Select text + hotkey + speak instruction → LLM rewrites it in place{RESET}");
     println!();
@@ -1434,7 +1434,7 @@ fn configure_llm() -> Result<Option<LlmConfig>> {
 }
 
 /// Show model selection menu for a given provider, with an "Other" option.
-fn select_llm_model(provider_idx: usize) -> Result<String> {
+pub(crate) fn select_llm_model(provider_idx: usize) -> Result<String> {
     let models: &[(&str, &str)] = match provider_idx {
         0 => OPENAI_MODELS,
         1 => GROQ_MODELS,
