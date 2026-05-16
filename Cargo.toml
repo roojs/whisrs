@@ -69,7 +69,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["shape"] }
 zbus = "5"
 
 [dependencies.ksni]

@@ -1,7 +1,6 @@
 //! Bottom-screen recording overlay.
 //!
-//! The overlay is optional and currently implemented for wlroots layer-shell
-//! compositors such as Hyprland and Sway.
+//! The overlay is optional and has native Wayland layer-shell and X11 backends.
 
 #[cfg(feature = "overlay")]
 mod service;

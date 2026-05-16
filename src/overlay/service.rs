@@ -1,4 +1,4 @@
-//! Wayland layer-shell overlay shown while recording or transcribing.
+//! Desktop overlay shown while recording or transcribing.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -15,6 +15,16 @@ enum OverlayError {
     Shm(#[from] smithay_client_toolkit::shm::CreatePoolError),
     #[error("Wayland dispatch error: {0}")]
     Dispatch(#[from] wayland_client::DispatchError),
+    #[error("X11 connection error: {0}")]
+    X11Connect(#[from] x11rb::errors::ConnectError),
+    #[error("X11 connection error: {0}")]
+    X11Connection(#[from] x11rb::errors::ConnectionError),
+    #[error("X11 reply error: {0}")]
+    X11Reply(#[from] x11rb::errors::ReplyError),
+    #[error("X11 reply/id error: {0}")]
+    X11ReplyOrId(#[from] x11rb::errors::ReplyOrIdError),
+    #[error("X11 ARGB visual not available")]
+    X11Visual,
     #[error("D-Bus error: {0}")]
     DBus(#[from] zbus::Error),
     #[error("D-Bus signal error: {0}")]
@@ -46,8 +56,20 @@ use tracing::{info, warn};
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_region, wl_shm, wl_surface},
-    Connection, Dispatch, QueueHandle,
+    Connection as WaylandConnection, Dispatch, QueueHandle,
 };
+use x11rb::connection::{Connection as X11Connection, RequestConnection};
+use x11rb::protocol::{
+    shape::{ConnectionExt as X11ShapeConnectionExt, SK, SO, X11_EXTENSION_NAME as SHAPE_EXT},
+    xproto::{
+        AtomEnum, ClipOrdering, ColormapAlloc, ConfigureWindowAux,
+        ConnectionExt as X11ProtoConnectionExt, CreateGCAux, CreateWindowAux, EventMask,
+        ImageFormat, PropMode, Rectangle, Screen, StackMode, VisualClass, Visualid, Window,
+        WindowClass,
+    },
+};
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as X11WrapperConnectionExt;
 
 use crate::{OverlayConfig, State};
 
@@ -184,31 +206,43 @@ impl Theme {
 
 /// Spawn the bottom recording overlay.
 ///
-/// The Wayland event loop runs on a dedicated OS thread because it is a
-/// blocking client loop. A small Tokio task forwards daemon state changes into
+/// Native compositor event loops run on a dedicated OS thread because they are
+/// blocking client loops. A small Tokio task forwards daemon state changes into
 /// that thread.
 pub async fn spawn_overlay(
     mut state_rx: watch::Receiver<State>,
     mut level_rx: watch::Receiver<f32>,
     config: OverlayConfig,
 ) {
-    let gnome_state_rx = state_rx.clone();
-    let gnome_level_rx = level_rx.clone();
-    let gnome_theme = config.theme.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_theme).await {
-            warn!("GNOME overlay D-Bus broadcaster unavailable: {e:#}");
-        }
-    });
+    if is_gnome_desktop() {
+        let gnome_state_rx = state_rx.clone();
+        let gnome_level_rx = level_rx.clone();
+        let gnome_theme = config.theme.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_theme).await
+            {
+                warn!("GNOME overlay D-Bus broadcaster unavailable: {e:#}");
+            }
+        });
+    }
 
     let (tx, rx) = mpsc::channel::<State>();
     let (level_tx, level_rx_thread) = mpsc::channel::<f32>();
 
+    let backend = OverlayBackend::detect();
     let overlay_config = config;
     std::thread::Builder::new()
         .name("whisrs-overlay".to_string())
         .spawn(move || {
-            if let Err(e) = run_overlay(rx, level_rx_thread, overlay_config) {
+            let result = match backend {
+                OverlayBackend::Wayland => run_overlay(rx, level_rx_thread, overlay_config),
+                OverlayBackend::X11 => run_x11_overlay(rx, level_rx_thread, overlay_config),
+                OverlayBackend::Unavailable => {
+                    warn!("overlay unavailable: no Wayland or X11 display in environment");
+                    return;
+                }
+            };
+            if let Err(e) = result {
                 warn!("overlay unavailable: {e:#}");
             }
         })
@@ -231,6 +265,43 @@ pub async fn spawn_overlay(
             }
         }
     });
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OverlayBackend {
+    Wayland,
+    X11,
+    Unavailable,
+}
+
+impl OverlayBackend {
+    fn detect() -> Self {
+        if env_var_is_set("WAYLAND_DISPLAY") && !matches_env("XDG_SESSION_TYPE", "x11") {
+            Self::Wayland
+        } else if env_var_is_set("DISPLAY") {
+            Self::X11
+        } else {
+            Self::Unavailable
+        }
+    }
+}
+
+fn env_var_is_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+fn matches_env(name: &str, expected: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn is_gnome_desktop() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|value| {
+            value
+                .split(':')
+                .any(|part| part.eq_ignore_ascii_case("GNOME"))
+        })
+        .unwrap_or(false)
 }
 
 async fn run_gnome_broadcaster(
@@ -334,7 +405,7 @@ fn run_overlay(
     let height = config.clamped_height();
     let theme = Theme::from_config(&config);
 
-    let conn = Connection::connect_to_env()?;
+    let conn = WaylandConnection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init(&conn)?;
     let qh = event_queue.handle();
 
@@ -359,39 +430,320 @@ fn run_overlay(
     layer.commit();
 
     let pool = SlotPool::new((width * height * 4) as usize, &shm)?;
-    let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         shm,
         pool,
-        pixmap,
         layer,
-        state_rx,
-        level_rx,
+        renderer: OverlayRenderer::new(state_rx, level_rx, width, height, theme)?,
         exit: false,
         first_configure: true,
-        width,
-        height,
-        target_state: State::Idle,
-        visible_state: State::Idle,
-        spawn_started: Instant::now(),
-        spawn_in: false,
-        frame: 0,
-        level: 0.0,
-        level_target: 0.0,
-        level_velocity: 0.0,
-        last_update: Instant::now(),
-        theme,
     };
 
     info!("recording overlay started");
     while !overlay.exit {
-        overlay.apply_state_updates();
+        overlay.renderer.apply_state_updates();
         event_queue.blocking_dispatch(&mut overlay)?;
     }
 
     Ok(())
+}
+
+fn run_x11_overlay(
+    state_rx: mpsc::Receiver<State>,
+    level_rx: mpsc::Receiver<f32>,
+    config: OverlayConfig,
+) -> Result<(), OverlayError> {
+    let width = config.clamped_width() as u16;
+    let height = config.clamped_height() as u16;
+    let theme = Theme::from_config(&config);
+
+    let (conn, screen_num) = RustConnection::connect(None)?;
+    let screen = &conn.setup().roots[screen_num];
+    let visual = find_argb_visual(screen).ok_or(OverlayError::X11Visual)?;
+    let atoms = X11Atoms::new(&conn)?;
+
+    let colormap = conn.generate_id()?;
+    conn.create_colormap(ColormapAlloc::NONE, colormap, screen.root, visual.visual_id)?;
+
+    let x = centered_x(screen, width);
+    let y = bottom_y(screen, height);
+    let window = conn.generate_id()?;
+    conn.create_window(
+        visual.depth,
+        window,
+        screen.root,
+        x,
+        y,
+        width,
+        height,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        visual.visual_id,
+        &CreateWindowAux::default()
+            .background_pixel(0)
+            .border_pixel(0)
+            .colormap(colormap)
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE),
+    )?;
+
+    set_x11_window_hints(&conn, window, &atoms)?;
+    let shape_supported = make_x11_window_click_through(&conn, window)?;
+
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, window, &CreateGCAux::default().graphics_exposures(0))?;
+    conn.flush()?;
+
+    let mut renderer =
+        OverlayRenderer::new(state_rx, level_rx, width as u32, height as u32, theme)?;
+    let mut frame = vec![0_u8; width as usize * height as usize * 4];
+    let mut mapped = false;
+
+    info!("recording X11 overlay started");
+    loop {
+        while conn.poll_for_event()?.is_some() {}
+
+        renderer.draw_frame();
+        let visible_shape = alpha_shape_rectangles(&renderer.pixmap);
+        if visible_shape.is_empty() {
+            if mapped {
+                conn.unmap_window(window)?;
+                conn.flush()?;
+                mapped = false;
+            }
+            std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
+            continue;
+        }
+
+        if shape_supported {
+            set_x11_bounding_shape(&conn, window, &visible_shape)?;
+        }
+        copy_pixmap_to_x11_zpixmap(&renderer.pixmap, visual, &mut frame);
+        if !mapped {
+            conn.map_window(window)?;
+            mapped = true;
+        }
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            window,
+            gc,
+            width,
+            height,
+            0,
+            0,
+            0,
+            visual.depth,
+            &frame,
+        )?;
+        conn.configure_window(
+            window,
+            &ConfigureWindowAux::default().stack_mode(StackMode::ABOVE),
+        )?;
+        conn.flush()?;
+        std::thread::sleep(Duration::from_millis(FRAME_MS as u64));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct X11ArgbVisual {
+    depth: u8,
+    visual_id: Visualid,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+    alpha_mask: u32,
+}
+
+fn find_argb_visual(screen: &Screen) -> Option<X11ArgbVisual> {
+    screen.allowed_depths.iter().find_map(|depth| {
+        if depth.depth != 32 {
+            return None;
+        }
+        let full_mask = depth_mask(depth.depth);
+        depth.visuals.iter().find_map(|visual| {
+            if visual.class != VisualClass::TRUE_COLOR {
+                return None;
+            }
+            let color_mask = visual.red_mask | visual.green_mask | visual.blue_mask;
+            let alpha_mask = full_mask & !color_mask;
+            (alpha_mask != 0).then_some(X11ArgbVisual {
+                depth: depth.depth,
+                visual_id: visual.visual_id,
+                red_mask: visual.red_mask,
+                green_mask: visual.green_mask,
+                blue_mask: visual.blue_mask,
+                alpha_mask,
+            })
+        })
+    })
+}
+
+fn depth_mask(depth: u8) -> u32 {
+    if depth >= 32 {
+        u32::MAX
+    } else {
+        (1_u32 << depth) - 1
+    }
+}
+
+struct X11Atoms {
+    atom: u32,
+    net_wm_name: u32,
+    net_wm_window_type: u32,
+    net_wm_window_type_notification: u32,
+    net_wm_state: u32,
+    net_wm_state_above: u32,
+    net_wm_state_skip_pager: u32,
+    net_wm_state_skip_taskbar: u32,
+    net_wm_state_sticky: u32,
+    net_wm_bypass_compositor: u32,
+    utf8_string: u32,
+}
+
+impl X11Atoms {
+    fn new(conn: &RustConnection) -> Result<Self, OverlayError> {
+        Ok(Self {
+            atom: u32::from(AtomEnum::ATOM),
+            net_wm_name: intern_atom(conn, b"_NET_WM_NAME")?,
+            net_wm_window_type: intern_atom(conn, b"_NET_WM_WINDOW_TYPE")?,
+            net_wm_window_type_notification: intern_atom(
+                conn,
+                b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
+            )?,
+            net_wm_state: intern_atom(conn, b"_NET_WM_STATE")?,
+            net_wm_state_above: intern_atom(conn, b"_NET_WM_STATE_ABOVE")?,
+            net_wm_state_skip_pager: intern_atom(conn, b"_NET_WM_STATE_SKIP_PAGER")?,
+            net_wm_state_skip_taskbar: intern_atom(conn, b"_NET_WM_STATE_SKIP_TASKBAR")?,
+            net_wm_state_sticky: intern_atom(conn, b"_NET_WM_STATE_STICKY")?,
+            net_wm_bypass_compositor: intern_atom(conn, b"_NET_WM_BYPASS_COMPOSITOR")?,
+            utf8_string: intern_atom(conn, b"UTF8_STRING")?,
+        })
+    }
+}
+
+fn intern_atom(conn: &RustConnection, name: &[u8]) -> Result<u32, OverlayError> {
+    Ok(conn.intern_atom(false, name)?.reply()?.atom)
+}
+
+fn set_x11_window_hints(
+    conn: &RustConnection,
+    window: Window,
+    atoms: &X11Atoms,
+) -> Result<(), OverlayError> {
+    conn.change_property8(
+        PropMode::REPLACE,
+        window,
+        atoms.net_wm_name,
+        atoms.utf8_string,
+        b"whisrs overlay",
+    )?;
+    conn.change_property8(
+        PropMode::REPLACE,
+        window,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        b"whisrs overlay",
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.net_wm_window_type,
+        atoms.atom,
+        &[atoms.net_wm_window_type_notification],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.net_wm_state,
+        atoms.atom,
+        &[
+            atoms.net_wm_state_above,
+            atoms.net_wm_state_skip_pager,
+            atoms.net_wm_state_skip_taskbar,
+            atoms.net_wm_state_sticky,
+        ],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.net_wm_bypass_compositor,
+        AtomEnum::CARDINAL,
+        &[2],
+    )?;
+    Ok(())
+}
+
+fn make_x11_window_click_through(
+    conn: &RustConnection,
+    window: Window,
+) -> Result<bool, OverlayError> {
+    if conn.extension_information(SHAPE_EXT)?.is_none() {
+        warn!("X11 SHAPE extension unavailable; overlay may intercept clicks");
+        return Ok(false);
+    }
+
+    conn.shape_rectangles(
+        SO::SET,
+        SK::INPUT,
+        ClipOrdering::UNSORTED,
+        window,
+        0,
+        0,
+        &[],
+    )?;
+    Ok(true)
+}
+
+fn set_x11_bounding_shape(
+    conn: &RustConnection,
+    window: Window,
+    rectangles: &[Rectangle],
+) -> Result<(), OverlayError> {
+    conn.shape_rectangles(
+        SO::SET,
+        SK::BOUNDING,
+        ClipOrdering::Y_SORTED,
+        window,
+        0,
+        0,
+        rectangles,
+    )?;
+    Ok(())
+}
+
+fn alpha_shape_rectangles(pixmap: &Pixmap) -> Vec<Rectangle> {
+    let width = pixmap.width() as usize;
+    let mut rectangles = Vec::new();
+
+    for (y, row) in pixmap.pixels().chunks_exact(width).enumerate() {
+        let Some(first) = row.iter().position(|px| px.alpha() != 0) else {
+            continue;
+        };
+        let last = row
+            .iter()
+            .rposition(|px| px.alpha() != 0)
+            .expect("row has a first alpha pixel");
+        rectangles.push(Rectangle {
+            x: first as i16,
+            y: y as i16,
+            width: (last - first + 1) as u16,
+            height: 1,
+        });
+    }
+
+    rectangles
+}
+
+fn centered_x(screen: &Screen, width: u16) -> i16 {
+    let x = (i32::from(screen.width_in_pixels) - i32::from(width)) / 2;
+    x.max(0).min(i32::from(i16::MAX)) as i16
+}
+
+fn bottom_y(screen: &Screen, height: u16) -> i16 {
+    let y = i32::from(screen.height_in_pixels) - i32::from(height) - BOTTOM_MARGIN;
+    y.max(0).min(i32::from(i16::MAX)) as i16
 }
 
 struct Overlay {
@@ -399,14 +751,18 @@ struct Overlay {
     output_state: OutputState,
     shm: Shm,
     pool: SlotPool,
-    pixmap: Pixmap,
     layer: LayerSurface,
-    state_rx: mpsc::Receiver<State>,
-    level_rx: mpsc::Receiver<f32>,
+    renderer: OverlayRenderer,
     exit: bool,
     first_configure: bool,
+}
+
+struct OverlayRenderer {
+    state_rx: mpsc::Receiver<State>,
+    level_rx: mpsc::Receiver<f32>,
     width: u32,
     height: u32,
+    pixmap: Pixmap,
     target_state: State,
     visible_state: State,
     /// Wall-clock instant when the current spawn animation started. The
@@ -452,7 +808,34 @@ struct AnimState {
     bars_locked: bool,
 }
 
-impl Overlay {
+impl OverlayRenderer {
+    fn new(
+        state_rx: mpsc::Receiver<State>,
+        level_rx: mpsc::Receiver<f32>,
+        width: u32,
+        height: u32,
+        theme: Theme,
+    ) -> Result<Self, OverlayError> {
+        let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
+        Ok(Self {
+            state_rx,
+            level_rx,
+            width,
+            height,
+            pixmap,
+            target_state: State::Idle,
+            visible_state: State::Idle,
+            spawn_started: Instant::now(),
+            spawn_in: false,
+            frame: 0,
+            level: 0.0,
+            level_target: 0.0,
+            level_velocity: 0.0,
+            last_update: Instant::now(),
+            theme,
+        })
+    }
+
     fn apply_state_updates(&mut self) {
         while let Ok(state) = self.state_rx.try_recv() {
             let was_idle = self.target_state == State::Idle;
@@ -572,16 +955,10 @@ impl Overlay {
         }
     }
 
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
+    fn draw_frame(&mut self) {
         self.apply_state_updates();
 
-        let width = self.width;
-        let height = self.height;
-        let stride = width as i32 * 4;
-
-        // Render into our owned pixmap first so the buffer borrow on the
-        // shm pool doesn't conflict with the pixmap borrow.
-        let anim = self.anim(height as f32);
+        let anim = self.anim(self.height as f32);
         let level_gated = if anim.bars_locked { 0.0 } else { self.level };
         draw_overlay(
             &mut self.pixmap,
@@ -592,6 +969,16 @@ impl Overlay {
             &self.theme,
         );
         self.frame = self.frame.wrapping_add(1);
+    }
+}
+
+impl Overlay {
+    fn draw(&mut self, qh: &QueueHandle<Self>) {
+        let width = self.renderer.width;
+        let height = self.renderer.height;
+        let stride = width as i32 * 4;
+
+        self.renderer.draw_frame();
 
         let Ok((buffer, canvas)) = self.pool.create_buffer(
             width as i32,
@@ -602,7 +989,7 @@ impl Overlay {
             warn!("failed to allocate overlay buffer");
             return;
         };
-        copy_pixmap_to_argb8888(&self.pixmap, canvas);
+        copy_pixmap_to_argb8888(&self.renderer.pixmap, canvas);
 
         self.layer
             .wl_surface()
@@ -649,10 +1036,34 @@ fn copy_pixmap_to_argb8888(pixmap: &Pixmap, canvas: &mut [u8]) {
     }
 }
 
+fn copy_pixmap_to_x11_zpixmap(pixmap: &Pixmap, visual: X11ArgbVisual, canvas: &mut [u8]) {
+    let src = pixmap.pixels();
+    debug_assert_eq!(src.len() * 4, canvas.len());
+    for (i, px) in src.iter().enumerate() {
+        let pre: PremultipliedColorU8 = *px;
+        let pixel = pack_masked_channel(pre.red(), visual.red_mask)
+            | pack_masked_channel(pre.green(), visual.green_mask)
+            | pack_masked_channel(pre.blue(), visual.blue_mask)
+            | pack_masked_channel(pre.alpha(), visual.alpha_mask);
+        canvas[i * 4..i * 4 + 4].copy_from_slice(&pixel.to_ne_bytes());
+    }
+}
+
+fn pack_masked_channel(value: u8, mask: u32) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
+    let bits = mask.count_ones();
+    let shift = mask.trailing_zeros();
+    let max = (1_u64 << bits) - 1;
+    let scaled = (u64::from(value) * max + 127) / 255;
+    ((scaled << shift) as u32) & mask
+}
+
 impl CompositorHandler for Overlay {
     fn scale_factor_changed(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _new_factor: i32,
@@ -661,7 +1072,7 @@ impl CompositorHandler for Overlay {
 
     fn transform_changed(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _new_transform: wl_output::Transform,
@@ -670,7 +1081,7 @@ impl CompositorHandler for Overlay {
 
     fn frame(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _time: u32,
@@ -680,7 +1091,7 @@ impl CompositorHandler for Overlay {
 
     fn surface_enter(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
@@ -689,7 +1100,7 @@ impl CompositorHandler for Overlay {
 
     fn surface_leave(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
@@ -704,7 +1115,7 @@ impl OutputHandler for Overlay {
 
     fn new_output(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
@@ -712,7 +1123,7 @@ impl OutputHandler for Overlay {
 
     fn update_output(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
@@ -720,7 +1131,7 @@ impl OutputHandler for Overlay {
 
     fn output_destroyed(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
@@ -728,21 +1139,23 @@ impl OutputHandler for Overlay {
 }
 
 impl LayerShellHandler for Overlay {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
+    fn closed(
+        &mut self,
+        _conn: &WaylandConnection,
+        _qh: &QueueHandle<Self>,
+        _layer: &LayerSurface,
+    ) {
         self.exit = true;
     }
 
     fn configure(
         &mut self,
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
-        configure: LayerSurfaceConfigure,
+        _configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        self.width = configure.new_size.0.max(self.width);
-        self.height = configure.new_size.1.max(self.height);
-
         if self.first_configure {
             self.first_configure = false;
             self.draw(qh);
@@ -762,7 +1175,7 @@ impl Dispatch<wl_region::WlRegion, ()> for Overlay {
         _proxy: &wl_region::WlRegion,
         _event: wl_region::Event,
         _data: &(),
-        _conn: &Connection,
+        _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
     ) {
     }
