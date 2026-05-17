@@ -71,7 +71,11 @@ if command -v pacman &>/dev/null; then
 elif command -v apt-get &>/dev/null; then
     info "Detected:" "Debian/Ubuntu"
     needed=()
-    for pkg in libasound2 libxkbcommon0 ca-certificates curl tar; do
+    alsa_pkg="libasound2"
+    if ! apt-cache policy "$alsa_pkg" 2>/dev/null | grep -q 'Candidate: [^(]'; then
+        alsa_pkg="libasound2t64"
+    fi
+    for pkg in "$alsa_pkg" libxkbcommon0 ca-certificates curl tar; do
         if ! dpkg -s "$pkg" &>/dev/null 2>&1; then
             needed+=("$pkg")
         fi
