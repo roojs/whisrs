@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
 
@@ -90,6 +90,23 @@ struct AudioTranscriptionConfig {
 struct TurnDetectionConfig {
     #[serde(rename = "type")]
     detection_type: String,
+    threshold: f32,
+    prefix_padding_ms: u32,
+    silence_duration_ms: u32,
+}
+
+impl TurnDetectionConfig {
+    /// Standard server-VAD defaults for the OpenAI Realtime transcription API.
+    /// These match the values OpenAI's docs use for the `intent=transcription`
+    /// session type and stream mid-utterance partial transcripts.
+    fn server_vad_default() -> Self {
+        Self {
+            detection_type: "server_vad".to_string(),
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 500,
+        }
+    }
 }
 
 /// Client message: input_audio_buffer.append
@@ -153,7 +170,7 @@ impl SessionUpdate {
                             language: lang,
                             prompt: clamp_prompt(prompt),
                         },
-                        turn_detection: None,
+                        turn_detection: Some(TurnDetectionConfig::server_vad_default()),
                     },
                 },
             },
@@ -311,6 +328,14 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
             .await?;
         debug!("sent session.update for transcription model={model}");
 
+        // Oneshot signal from the receive loop to the send task: fire once
+        // the server has emitted the terminal
+        // `conversation.item.input_audio_transcription.completed` event (or
+        // any other terminal signal). The send task waits on this before
+        // closing the WebSocket, with a generous safety timeout to avoid
+        // hanging forever if the server stalls.
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+
         // Spawn a task to send audio.
         let send_task = tokio::spawn(async move {
             while let Some(chunk) = audio_rx.recv().await {
@@ -335,8 +360,10 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                 }
             }
 
-            // All real audio sent. Commit the buffer manually; this replaces
-            // server VAD, which some Realtime transcription models reject.
+            // All real audio sent. Send an explicit commit to signal "user
+            // pressed stop" — server VAD handles mid-utterance segmentation
+            // on its own, but the commit is still required to flush any
+            // trailing audio that didn't trigger a VAD stop.
             debug!("committing audio buffer for transcription");
             if let Ok(json) = serde_json::to_string(&AudioBufferCommit::new()) {
                 if ws_sink
@@ -348,16 +375,34 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                 }
             }
 
-            // Wait for the server to process the committed audio and send
-            // transcription events, then close the WebSocket. This ends
-            // the receive loop via the Close frame.
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            debug!("closing WebSocket after post-silence delay");
+            // Wait for the receive loop to observe the terminal transcription
+            // event, then close. A 30-second safety timeout protects against
+            // a stuck server. The previous hard 3-second sleep truncated
+            // long transcripts; this is event-driven instead.
+            match tokio::time::timeout(std::time::Duration::from_secs(30), done_rx).await {
+                Ok(Ok(())) => {
+                    debug!("closing WebSocket after terminal transcription event");
+                }
+                Ok(Err(_)) => {
+                    debug!("done channel dropped (receive loop exited) — closing WebSocket");
+                }
+                Err(_) => {
+                    warn!("no terminal transcription event after 30s — closing WebSocket anyway");
+                }
+            }
             ws_sink.send(tungstenite::Message::Close(None)).await.ok();
         });
 
-        // Receive transcription events (with a timeout to avoid hanging forever).
-        let timeout_duration = std::time::Duration::from_secs(15);
+        // Wrap `done_tx` in an Option so the receive loop can take it on the
+        // first terminal event and ensure we only ever send once.
+        let mut done_tx = Some(done_tx);
+
+        // Receive transcription events. The per-message timeout is a safety
+        // net against a stalled connection — for long utterances the server
+        // can take >15s after commit to return the completed event, so we
+        // use a generous bound here. The terminal `completed` event is what
+        // normally ends this loop (via the Close frame from the send task).
+        let timeout_duration = std::time::Duration::from_secs(60);
         while let Ok(Some(msg_result)) =
             tokio::time::timeout(timeout_duration, ws_source.next()).await
         {
@@ -377,6 +422,11 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                                 if let Some(transcript) = server_msg.transcript {
                                     debug!("realtime completed: {transcript}");
                                 }
+                                // Terminal event for this utterance — let the
+                                // send task close the WebSocket cleanly.
+                                if let Some(tx) = done_tx.take() {
+                                    tx.send(()).ok();
+                                }
                             }
                             "error" | "conversation.item.input_audio_transcription.failed" => {
                                 let err_msg = server_msg
@@ -386,6 +436,11 @@ impl TranscriptionBackend for OpenAIRealtimeBackend {
                                 error!("OpenAI Realtime error: {err_msg}");
                                 // Log the raw message for debugging.
                                 debug!("raw error message: {text}");
+                                // Treat as terminal so we don't wait the full
+                                // 30s safety timeout on a failed transcription.
+                                if let Some(tx) = done_tx.take() {
+                                    tx.send(()).ok();
+                                }
                             }
                             "session.created"
                             | "session.updated"
@@ -454,10 +509,12 @@ mod tests {
             json["session"]["audio"]["input"]["transcription"]["language"],
             "en"
         );
-        assert_eq!(
-            json["session"]["audio"]["input"]["turn_detection"],
-            serde_json::Value::Null
-        );
+        // Server VAD is enabled by default so deltas stream during recording.
+        let turn = &json["session"]["audio"]["input"]["turn_detection"];
+        assert_eq!(turn["type"], "server_vad");
+        assert_eq!(turn["threshold"], 0.5);
+        assert_eq!(turn["prefix_padding_ms"], 300);
+        assert_eq!(turn["silence_duration_ms"], 500);
     }
 
     #[test]
