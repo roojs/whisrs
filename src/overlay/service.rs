@@ -60,6 +60,7 @@ use wayland_client::{
 };
 use x11rb::connection::{Connection as X11Connection, RequestConnection};
 use x11rb::protocol::{
+    randr::{ConnectionExt as X11RandrConnectionExt, MonitorInfo, X11_EXTENSION_NAME as RANDR_EXT},
     shape::{ConnectionExt as X11ShapeConnectionExt, SK, SO, X11_EXTENSION_NAME as SHAPE_EXT},
     xproto::{
         AtomEnum, ClipOrdering, ColormapAlloc, ConfigureWindowAux,
@@ -541,13 +542,18 @@ fn run_x11_overlay(
             last_shape.extend_from_slice(&visible_shape);
         }
         copy_pixmap_to_x11_zpixmap(&renderer.pixmap, visual, &mut frame);
-        let just_mapped = if !mapped {
+        if !mapped {
+            let (x, y) = x11_overlay_position(&conn, screen, &atoms, width, height);
+            conn.configure_window(
+                window,
+                &ConfigureWindowAux::default()
+                    .x(i32::from(x))
+                    .y(i32::from(y))
+                    .stack_mode(StackMode::ABOVE),
+            )?;
             conn.map_window(window)?;
             mapped = true;
-            true
-        } else {
-            false
-        };
+        }
         conn.put_image(
             ImageFormat::Z_PIXMAP,
             window,
@@ -560,14 +566,6 @@ fn run_x11_overlay(
             visual.depth,
             &frame,
         )?;
-        // Only re-assert stacking on map — the WM honors the initial
-        // request and re-issuing it every frame is pointless churn.
-        if just_mapped {
-            conn.configure_window(
-                window,
-                &ConfigureWindowAux::default().stack_mode(StackMode::ABOVE),
-            )?;
-        }
         conn.flush()?;
         std::thread::sleep(Duration::from_millis(FRAME_MS));
     }
@@ -623,6 +621,7 @@ fn depth_mask(depth: u8) -> u32 {
 
 struct X11Atoms {
     atom: u32,
+    net_active_window: u32,
     net_wm_name: u32,
     net_wm_window_type: u32,
     net_wm_window_type_notification: u32,
@@ -639,6 +638,7 @@ impl X11Atoms {
     fn new(conn: &RustConnection) -> Result<Self, OverlayError> {
         Ok(Self {
             atom: u32::from(AtomEnum::ATOM),
+            net_active_window: intern_atom(conn, b"_NET_ACTIVE_WINDOW")?,
             net_wm_name: intern_atom(conn, b"_NET_WM_NAME")?,
             net_wm_window_type: intern_atom(conn, b"_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_notification: intern_atom(
@@ -778,14 +778,160 @@ fn alpha_shape_rectangles(pixmap: &Pixmap) -> Vec<Rectangle> {
     rectangles
 }
 
+fn x11_overlay_position(
+    conn: &RustConnection,
+    screen: &Screen,
+    atoms: &X11Atoms,
+    width: u16,
+    height: u16,
+) -> (i16, i16) {
+    let monitors = match active_x11_monitors(conn, screen.root) {
+        Ok(monitors) => monitors,
+        Err(e) => {
+            warn!("failed to query XRandR monitors for overlay placement: {e:#}");
+            Vec::new()
+        }
+    };
+
+    if let Some((cx, cy)) = match active_x11_window_center(conn, screen.root, atoms) {
+        Ok(center) => center,
+        Err(e) => {
+            warn!("failed to query active X11 window for overlay placement: {e:#}");
+            None
+        }
+    } {
+        if let Some(monitor) = monitors
+            .iter()
+            .find(|m| point_in_rect(cx, cy, i32::from(m.x), i32::from(m.y), m.width, m.height))
+        {
+            return position_in_rect(
+                i32::from(monitor.x),
+                i32::from(monitor.y),
+                u32::from(monitor.width),
+                u32::from(monitor.height),
+                width,
+                height,
+            );
+        }
+    }
+
+    if let Some(monitor) = monitors
+        .iter()
+        .find(|m| m.primary)
+        .or_else(|| monitors.first())
+    {
+        return position_in_rect(
+            i32::from(monitor.x),
+            i32::from(monitor.y),
+            u32::from(monitor.width),
+            u32::from(monitor.height),
+            width,
+            height,
+        );
+    }
+
+    (centered_x(screen, width), bottom_y(screen, height))
+}
+
+fn active_x11_monitors(
+    conn: &RustConnection,
+    root: Window,
+) -> Result<Vec<MonitorInfo>, OverlayError> {
+    if conn.extension_information(RANDR_EXT)?.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let reply = conn.randr_get_monitors(root, true)?.reply()?;
+    Ok(reply
+        .monitors
+        .into_iter()
+        .filter(|monitor| monitor.width > 0 && monitor.height > 0)
+        .collect())
+}
+
+fn active_x11_window_center(
+    conn: &RustConnection,
+    root: Window,
+    atoms: &X11Atoms,
+) -> Result<Option<(i32, i32)>, OverlayError> {
+    let reply = conn
+        .get_property(false, root, atoms.net_active_window, AtomEnum::WINDOW, 0, 1)?
+        .reply()?;
+
+    let Some(bytes) = reply.value.get(..4) else {
+        return Ok(None);
+    };
+    let window = u32::from_ne_bytes(bytes.try_into().expect("slice is exactly 4 bytes"));
+    if window == 0 {
+        return Ok(None);
+    }
+
+    let geometry = conn.get_geometry(window)?.reply()?;
+    let translated = conn.translate_coordinates(window, root, 0, 0)?.reply()?;
+    if !translated.same_screen {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        i32::from(translated.dst_x) + i32::from(geometry.width / 2),
+        i32::from(translated.dst_y) + i32::from(geometry.height / 2),
+    )))
+}
+
+fn point_in_rect(x: i32, y: i32, rx: i32, ry: i32, width: u16, height: u16) -> bool {
+    let right = rx.saturating_add(i32::from(width));
+    let bottom = ry.saturating_add(i32::from(height));
+    x >= rx && x < right && y >= ry && y < bottom
+}
+
+fn position_in_rect(
+    x: i32,
+    y: i32,
+    rect_width: u32,
+    rect_height: u32,
+    width: u16,
+    height: u16,
+) -> (i16, i16) {
+    let width = i32::from(width);
+    let height = i32::from(height);
+    let rect_width = i32::try_from(rect_width).unwrap_or(i32::MAX);
+    let rect_height = i32::try_from(rect_height).unwrap_or(i32::MAX);
+
+    let min_x = x;
+    let max_x = x
+        .saturating_add(rect_width)
+        .saturating_sub(width)
+        .max(min_x);
+    let centered_x = x.saturating_add((rect_width - width) / 2);
+
+    let min_y = y;
+    let max_y = y
+        .saturating_add(rect_height)
+        .saturating_sub(height)
+        .max(min_y);
+    let bottom_y = y
+        .saturating_add(rect_height)
+        .saturating_sub(height)
+        .saturating_sub(BOTTOM_MARGIN);
+
+    (
+        to_i16_coord(centered_x.clamp(min_x, max_x)),
+        to_i16_coord(bottom_y.clamp(min_y, max_y)),
+    )
+}
+
 fn centered_x(screen: &Screen, width: u16) -> i16 {
     let x = (i32::from(screen.width_in_pixels) - i32::from(width)) / 2;
-    x.max(0).min(i32::from(i16::MAX)) as i16
+    to_i16_coord(x.max(0))
 }
 
 fn bottom_y(screen: &Screen, height: u16) -> i16 {
     let y = i32::from(screen.height_in_pixels) - i32::from(height) - BOTTOM_MARGIN;
-    y.max(0).min(i32::from(i16::MAX)) as i16
+    to_i16_coord(y.max(0))
+}
+
+fn to_i16_coord(value: i32) -> i16 {
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 struct Overlay {
@@ -1611,6 +1757,21 @@ mod tests {
         assert!((ease_out_back(1.0, 0.4) - 1.0).abs() < 1e-6);
         // The "back" curve is supposed to peak above 1 in the middle.
         assert!(ease_out_back(0.85, 0.4) > 1.0);
+    }
+
+    #[test]
+    fn x11_position_in_rect_uses_monitor_bounds() {
+        assert_eq!(
+            position_in_rect(1920, 360, 1920, 1200, 100, 40),
+            (2830, 1504)
+        );
+        assert_eq!(position_in_rect(3840, 0, 1200, 1920, 100, 40), (4390, 1864));
+    }
+
+    #[test]
+    fn x11_point_in_rect_uses_half_open_bounds() {
+        assert!(point_in_rect(2830, 1504, 1920, 360, 1920, 1200));
+        assert!(!point_in_rect(3840, 1504, 1920, 360, 1920, 1200));
     }
 
     #[test]
