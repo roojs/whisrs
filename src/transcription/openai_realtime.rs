@@ -155,6 +155,7 @@ impl SessionUpdate {
         } else {
             language.to_string()
         };
+        let manual_commit = uses_manual_commit(model);
         Self {
             msg_type: "session.update".to_string(),
             session: SessionConfig {
@@ -168,14 +169,19 @@ impl SessionUpdate {
                         transcription: AudioTranscriptionConfig {
                             model: model.to_string(),
                             language: lang,
-                            prompt: clamp_prompt(prompt),
+                            prompt: (!manual_commit).then(|| clamp_prompt(prompt)).flatten(),
                         },
-                        turn_detection: Some(TurnDetectionConfig::server_vad_default()),
+                        turn_detection: (!manual_commit)
+                            .then(TurnDetectionConfig::server_vad_default),
                     },
                 },
             },
         }
     }
+}
+
+fn uses_manual_commit(model: &str) -> bool {
+    model.eq_ignore_ascii_case("gpt-realtime-whisper")
 }
 
 /// Trim, drop empties, and truncate at the API's 1024-char limit on a char
@@ -515,6 +521,20 @@ mod tests {
         assert_eq!(turn["threshold"], 0.5);
         assert_eq!(turn["prefix_padding_ms"], 300);
         assert_eq!(turn["silence_duration_ms"], 500);
+    }
+
+    #[test]
+    fn realtime_whisper_session_uses_manual_commit() {
+        let msg = SessionUpdate::new(
+            "gpt-realtime-whisper",
+            "en",
+            Some("domain prompt is unsupported here"),
+        );
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(json["session"]["audio"]["input"]["turn_detection"].is_null());
+        assert!(json["session"]["audio"]["input"]["transcription"]
+            .get("prompt")
+            .is_none());
     }
 
     #[test]
