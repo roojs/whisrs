@@ -229,7 +229,38 @@ Per-release details: [docs/version-roadmap.md](docs/version-roadmap.md).
 
 ## Troubleshooting
 
-See [docs/troubleshooting.md](docs/troubleshooting.md).
+See [docs/troubleshooting.md](docs/troubleshooting.md) for the full list. Two issues come up often enough to call out here:
+
+### Garbled output / wrong characters on non-US layouts
+
+whisrs auto-detects your XKB layout via the active compositor (Hyprland / Sway), then `setxkbmap` (X11), then `localectl` (systemd), then the `XKB_DEFAULT_LAYOUT` / `XKB_DEFAULT_VARIANT` env vars — in that order. If none succeed, it falls back to US/QWERTY, and on a non-US layout that produces garbled output (e.g. `"this"` typed as `"èCDU"` on `fr(bepo)`).
+
+To diagnose, run the daemon in the foreground with debug logging and look for the detected layout:
+
+```bash
+RUST_LOG=debug whisrsd
+```
+
+If the layout is missing or wrong, fix it one of two ways:
+
+1. Make sure `localectl status` reports the right `X11 Layout` and `X11 Variant`. This is the system source-of-truth and works without any X session env vars.
+2. Force the layout via env vars in your systemd service override:
+
+   ```bash
+   systemctl --user edit whisrs.service
+   ```
+
+   ```ini
+   [Service]
+   Environment=XKB_DEFAULT_LAYOUT=fr
+   Environment=XKB_DEFAULT_VARIANT=bepo
+   ```
+
+   Then `systemctl --user restart whisrs.service`.
+
+### Hotkey keys are physical positions, not layout characters
+
+The configured hotkey trigger (e.g. `Ctrl+Shift+W`) is interpreted as the physical evdev keycode at the US/QWERTY `W` position, regardless of the active layout. This is intentional — the hotkey listener reads raw evdev events before any XKB translation, which is how every evdev-based hotkey tool works (xremap, sxhkd --evdev). On non-US layouts, pick the trigger by its physical position on a QWERTY keyboard.
 
 ---
 

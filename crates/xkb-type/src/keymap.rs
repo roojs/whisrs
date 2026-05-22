@@ -30,6 +30,9 @@ impl KeyboardLayout {
         if let Some(kl) = Self::from_x11() {
             return kl;
         }
+        if let Some(kl) = Self::from_localectl() {
+            return kl;
+        }
         if let Some(kl) = Self::from_env() {
             return kl;
         }
@@ -156,6 +159,48 @@ impl KeyboardLayout {
         parsed
     }
 
+    /// Query `localectl status` for the system X11 layout/variant.
+    ///
+    /// `localectl` is a systemd binary that doesn't need `DISPLAY` or
+    /// `XAUTHORITY`. On a systemd host this is the source-of-truth for
+    /// the system keyboard layout when the X11 environment isn't
+    /// available to the daemon (e.g. running under `systemd --user`
+    /// with `DISPLAY` not imported into the user manager).
+    fn from_localectl() -> Option<Self> {
+        let output = match Command::new("localectl").arg("status").output() {
+            Ok(out) => out,
+            Err(_e) => {
+                debug!("localectl probe failed to spawn: {_e}");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            debug!(
+                "localectl status exited non-zero: status={:?}",
+                output.status.code()
+            );
+            return None;
+        }
+
+        let stdout = match String::from_utf8(output.stdout) {
+            Ok(s) => s,
+            Err(_e) => {
+                debug!("localectl status stdout was not valid utf-8: {_e}");
+                return None;
+            }
+        };
+        let parsed = parse_localectl_status(&stdout);
+        if let Some(_kl) = parsed.as_ref() {
+            debug!(
+                "layout detected via localectl: layout={} variant={}",
+                _kl.layout, _kl.variant
+            );
+        } else {
+            debug!("localectl status returned no parseable X11 layout");
+        }
+        parsed
+    }
+
     fn from_env() -> Option<Self> {
         let layout = std::env::var("XKB_DEFAULT_LAYOUT").ok()?;
         if layout.is_empty() {
@@ -177,6 +222,37 @@ fn parse_setxkbmap_query(output: &str) -> Option<KeyboardLayout> {
         match key.trim() {
             "layout" => layout = Some(value.trim().to_string()),
             "variant" => variant = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    let layout = layout.filter(|s| !s.is_empty())?;
+    Some(KeyboardLayout {
+        layout,
+        variant: variant.unwrap_or_default(),
+    })
+}
+
+/// Parse `localectl status` output for the X11 keyboard layout/variant.
+///
+/// `localectl` indents its key/value lines with a varying number of
+/// leading spaces (3 or 4 in practice). Trim each line before splitting
+/// on the first `:` to be robust against that. Only `X11 Layout` and
+/// `X11 Variant` are extracted — other keys (`System Locale`,
+/// `VC Keymap`, `X11 Model`, `X11 Options`) are intentionally ignored
+/// to keep this patch tightly scoped to the layout-detection bug.
+fn parse_localectl_status(output: &str) -> Option<KeyboardLayout> {
+    let mut layout = None;
+    let mut variant = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "X11 Layout" => layout = Some(value.trim().to_string()),
+            "X11 Variant" => variant = Some(value.trim().to_string()),
             _ => {}
         }
     }
@@ -872,6 +948,113 @@ mod tests {
         assert!(
             result.is_none(),
             "from_sway must return None (display names ≠ XKB codes); got {result:?}"
+        );
+    }
+
+    // --- localectl parser tests ---
+
+    #[test]
+    fn parse_localectl_us_no_variant() {
+        let output = "\
+System Locale: LANG=en_US.UTF-8
+    VC Keymap: us
+   X11 Layout: us
+    X11 Model: pc105+inet
+  X11 Options: terminate:ctrl_alt_bksp
+";
+        let kl = parse_localectl_status(output).expect("should parse US layout");
+        assert_eq!(kl.layout, "us");
+        assert_eq!(kl.variant, "");
+    }
+
+    #[test]
+    fn parse_localectl_fr_bepo_full() {
+        let output = "\
+System Locale: LANG=en_US.UTF-8
+    VC Keymap: fr-bepo
+   X11 Layout: fr
+    X11 Model: pc104
+  X11 Variant: bepo
+  X11 Options: caps:swapescape,compose:rwin
+";
+        let kl = parse_localectl_status(output).expect("should parse fr(bepo)");
+        assert_eq!(kl.layout, "fr");
+        assert_eq!(kl.variant, "bepo");
+    }
+
+    #[test]
+    fn parse_localectl_empty_layout_returns_none() {
+        let output = "\
+System Locale: LANG=en_US.UTF-8
+    VC Keymap: us
+   X11 Layout:
+    X11 Model: pc105
+";
+        assert!(parse_localectl_status(output).is_none());
+    }
+
+    #[test]
+    fn parse_localectl_missing_x11_section_returns_none() {
+        let output = "\
+System Locale: LANG=en_US.UTF-8
+    VC Keymap: us
+";
+        assert!(parse_localectl_status(output).is_none());
+    }
+
+    #[test]
+    fn parse_localectl_tolerates_whitespace_variants() {
+        // Mix tabs, varying leading-space widths, and trailing whitespace.
+        let output = "System Locale: LANG=en_US.UTF-8\n\
+\t\tVC Keymap: fr-bepo\n\
+ X11 Layout:   fr  \n\
+      X11 Model: pc104\n\
+\tX11 Variant:\tbepo\n";
+        let kl = parse_localectl_status(output).expect("should tolerate whitespace mix");
+        assert_eq!(kl.layout, "fr");
+        assert_eq!(kl.variant, "bepo");
+    }
+
+    #[test]
+    fn parse_localectl_ignores_unknown_keys() {
+        let output = "\
+System Locale: LANG=en_US.UTF-8
+    VC Keymap: us
+          Foo: bar
+   X11 Layout: us
+    X11 Model: pc105
+       Random: line with: multiple colons
+  X11 Variant: dvorak
+";
+        let kl = parse_localectl_status(output).expect("should ignore unknown keys");
+        assert_eq!(kl.layout, "us");
+        assert_eq!(kl.variant, "dvorak");
+    }
+
+    // --- localectl chain-gap regression ---
+
+    /// Issue #39: detection must have at least one source that works
+    /// without any X session env vars on a systemd host. `from_localectl`
+    /// fills that gap. If `localectl` is installed (the case on every
+    /// systemd distro), it must return `Some(layout)` with a non-empty
+    /// layout code — this is what prevents the US/QWERTY fallback that
+    /// produced garbled output for fr(bepo) users running under
+    /// `systemd --user`.
+    #[test]
+    fn from_localectl_returns_layout_when_available() {
+        // Skip if the binary is unavailable (e.g. non-systemd CI image).
+        if Command::new("localectl").arg("--version").output().is_err() {
+            eprintln!("skipping: localectl not on PATH");
+            return;
+        }
+        let result = KeyboardLayout::from_localectl();
+        let kl = result.expect(
+            "from_localectl must return Some(_) on a systemd host — \
+             this is the detection-chain gap that allowed issue #39",
+        );
+        assert!(
+            !kl.layout.is_empty(),
+            "from_localectl returned Some with empty layout: {kl:?}"
         );
     }
 }
