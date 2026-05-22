@@ -21,6 +21,11 @@ pub struct KeyboardLayout {
 
 impl KeyboardLayout {
     pub fn detect() -> Self {
+        // Order matters: compositor IPC and X11 reflect the *currently active* session
+        // layout (honoring runtime switches via xkb-switch and friends), so they win when
+        // reachable. localectl is the systemd source-of-truth fallback for cases where
+        // X env vars aren't visible (e.g. running as a systemd --user service, issue #39).
+        // Env vars come last as an explicit user override escape hatch.
         if let Some(kl) = Self::from_hyprland() {
             return kl;
         }
