@@ -2079,10 +2079,21 @@ fn is_terminal_class(class: &str) -> bool {
     TERMINAL_CLASSES.iter().any(|t| lower.contains(t))
 }
 
-/// Returns `true` when the first character of `text` is an ASCII punctuation
-/// mark that should not have a space inserted before it.
+/// Returns `true` when the first character of `text` is a punctuation mark
+/// that should not have a space inserted before it.
+///
+/// Covers ASCII sentence/clause terminators and closing brackets, their CJK
+/// fullwidth equivalents, the ellipsis character, and closing curly quotes.
+/// Opening brackets, opening curly quotes, and dashes are intentionally
+/// excluded — they should retain a leading space.
 fn leads_with_punct(text: &str) -> bool {
-    text.starts_with(['.', ',', '!', '?', ';', ':', ')', ']', '}'])
+    text.starts_with([
+        // ASCII
+        '.', ',', '!', '?', ';', ':', ')', ']', '}', // CJK fullwidth equivalents
+        '。', '，', '！', '？', '；', '：', '）', '】', '｝', // Ellipsis
+        '…',  // Closing curly quotes (U+2019, U+201D)
+        '\u{2019}', '\u{201D}',
+    ])
 }
 
 async fn handle_cancel(
@@ -2246,5 +2257,86 @@ mod tests {
     #[test]
     fn transcription_prompt_empty_string_with_empty_vocab_is_none() {
         assert_eq!(transcription_prompt(Some(""), &[]), None);
+    }
+
+    #[test]
+    fn leads_with_punct_ascii_terminators_and_closers() {
+        // Sentence/clause terminators and closing brackets that should not get
+        // a leading space inserted before them.
+        for p in [".", ",", "!", "?", ";", ":", ")", "]", "}"] {
+            assert!(
+                leads_with_punct(p),
+                "expected leads_with_punct({p:?}) to be true",
+            );
+        }
+    }
+
+    #[test]
+    fn leads_with_punct_ascii_followed_by_more_text() {
+        // Helper should fire based on the first char, regardless of what follows.
+        assert!(leads_with_punct(". And then"));
+        assert!(leads_with_punct(", and"));
+        assert!(leads_with_punct("?!"));
+    }
+
+    #[test]
+    fn leads_with_punct_unicode_cjk_fullwidth() {
+        // CJK fullwidth equivalents of ASCII punctuation.
+        for p in ["。", "，", "！", "？", "；", "：", "）", "】", "｝"] {
+            assert!(
+                leads_with_punct(p),
+                "expected leads_with_punct({p:?}) to be true",
+            );
+        }
+    }
+
+    #[test]
+    fn leads_with_punct_unicode_ellipsis() {
+        assert!(leads_with_punct("…"));
+        assert!(leads_with_punct("… and then"));
+    }
+
+    #[test]
+    fn leads_with_punct_unicode_closing_curly_quotes() {
+        // U+2019 RIGHT SINGLE QUOTATION MARK
+        assert!(leads_with_punct("\u{2019}"));
+        // U+201D RIGHT DOUBLE QUOTATION MARK
+        assert!(leads_with_punct("\u{201D}"));
+    }
+
+    #[test]
+    fn leads_with_punct_leading_space_is_false() {
+        // Whitespace prefix means the caller already has spacing — do not
+        // suppress an additional one based on punctuation logic.
+        assert!(!leads_with_punct(" hello"));
+        assert!(!leads_with_punct(" ."));
+    }
+
+    #[test]
+    fn leads_with_punct_non_punct_prefix_is_false() {
+        assert!(!leads_with_punct("hello"));
+        assert!(!leads_with_punct("a."));
+        assert!(!leads_with_punct("1, 2, 3"));
+    }
+
+    #[test]
+    fn leads_with_punct_empty_is_false() {
+        assert!(!leads_with_punct(""));
+    }
+
+    #[test]
+    fn leads_with_punct_opening_brackets_are_false() {
+        // Opening brackets should retain a leading space.
+        assert!(!leads_with_punct("("));
+        assert!(!leads_with_punct("["));
+        assert!(!leads_with_punct("{"));
+    }
+
+    #[test]
+    fn leads_with_punct_opening_curly_quotes_are_false() {
+        // U+2018 LEFT SINGLE QUOTATION MARK
+        assert!(!leads_with_punct("\u{2018}"));
+        // U+201C LEFT DOUBLE QUOTATION MARK
+        assert!(!leads_with_punct("\u{201C}"));
     }
 }
