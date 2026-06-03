@@ -45,7 +45,15 @@ impl DecodedWav {
 /// scaling to f32. This is a pure function with no audio device access so it
 /// can be unit-tested.
 pub fn decode_wav(wav_bytes: &[u8]) -> Result<DecodedWav, WhisrsError> {
-    let reader = hound::WavReader::new(Cursor::new(wav_bytes))
+    // Some encoders (ffmpeg/Lavf, which Groq's TTS endpoint uses) stream WAV to
+    // a non-seekable output and leave the RIFF and `data` chunk sizes as the
+    // 0xFFFFFFFF "unknown length" sentinel. hound then rejects the file
+    // ("data chunk length is not a multiple of sample size"). Repair the length
+    // fields to the real byte counts before parsing.
+    let repaired = repair_streaming_wav(wav_bytes);
+    let bytes: &[u8] = repaired.as_deref().unwrap_or(wav_bytes);
+
+    let reader = hound::WavReader::new(Cursor::new(bytes))
         .map_err(|e| WhisrsError::Audio(format!("failed to read WAV header: {e}")))?;
     let spec = reader.spec();
 
@@ -78,6 +86,58 @@ pub fn decode_wav(wav_bytes: &[u8]) -> Result<DecodedWav, WhisrsError> {
     })
 }
 
+/// Repair WAV files written to a non-seekable stream, where the `RIFF` and
+/// `data` chunk sizes are left as the 0xFFFFFFFF "unknown length" sentinel (or
+/// otherwise overrun the buffer). Rewrites both to the real byte counts.
+///
+/// Returns `Some(fixed_bytes)` when a repair was applied, or `None` when the
+/// input is already well-formed or is not a recognizable RIFF/WAVE stream (in
+/// which case the caller passes the original bytes through to the parser).
+fn repair_streaming_wav(bytes: &[u8]) -> Option<Vec<u8>> {
+    const SENTINEL: u32 = 0xFFFF_FFFF;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let read_u32 =
+        |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+
+    let mut block_align: usize = 0;
+    let mut off = 12usize;
+    while off + 8 <= bytes.len() {
+        let id = &bytes[off..off + 4];
+        let len = read_u32(off + 4);
+        let payload = off + 8;
+
+        if id == b"fmt " && payload + 16 <= bytes.len() {
+            // blockAlign sits at offset 12..14 within the fmt payload.
+            block_align = u16::from_le_bytes([bytes[payload + 12], bytes[payload + 13]]) as usize;
+        }
+
+        if id == b"data" {
+            let avail = bytes.len() - payload;
+            // Only repair a clearly-bogus length; leave well-formed files alone.
+            if len != SENTINEL && (len as usize) <= avail {
+                return None;
+            }
+            let ba = block_align.max(1);
+            let fixed = avail - (avail % ba);
+            let mut out = bytes.to_vec();
+            out[payload - 4..payload].copy_from_slice(&(fixed as u32).to_le_bytes());
+            // RIFF size = everything after the leading 8 bytes, through the data payload.
+            let riff = (payload + fixed - 8) as u32;
+            out[4..8].copy_from_slice(&riff.to_le_bytes());
+            return Some(out);
+        }
+
+        // Can't safely walk past a sentinel-length chunk that precedes `data`.
+        if len == SENTINEL {
+            return None;
+        }
+        off = off.checked_add(8 + len as usize + (len as usize & 1))?;
+    }
+    None
+}
+
 /// Play WAV-encoded audio on the default output device, blocking until the clip
 /// finishes or `stop` is set to `true`.
 ///
@@ -88,6 +148,64 @@ pub fn decode_wav(wav_bytes: &[u8]) -> Result<DecodedWav, WhisrsError> {
 pub fn play_wav(wav_bytes: &[u8], stop: Arc<AtomicBool>) -> Result<(), WhisrsError> {
     let decoded = decode_wav(wav_bytes)?;
     play_decoded(decoded, stop)
+}
+
+/// Resample interleaved f32 audio from `(src_rate, src_channels)` to
+/// `(dst_rate, dst_channels)`.
+///
+/// The source is downmixed to mono and then fanned out across the destination
+/// channels, with linear interpolation for the rate conversion. This is aimed
+/// at speech (Groq's TTS is mono); a stereo music source would lose its imaging,
+/// which is acceptable for this playback path.
+fn resample_remap(
+    src: &[f32],
+    src_channels: u16,
+    src_rate: u32,
+    dst_channels: u16,
+    dst_rate: u32,
+) -> Vec<f32> {
+    let src_ch = src_channels.max(1) as usize;
+    let dst_ch = dst_channels.max(1) as usize;
+    let src_frames = src.len() / src_ch;
+    if src_frames == 0 || src_rate == 0 || dst_rate == 0 {
+        return Vec::new();
+    }
+
+    // Downmix to a mono signal.
+    let mono: Vec<f32> = (0..src_frames)
+        .map(|i| {
+            let acc: f32 = (0..src_ch).map(|c| src[i * src_ch + c]).sum();
+            acc / src_ch as f32
+        })
+        .collect();
+
+    // Fan a mono frame value out across all destination channels.
+    let fan = |out: &mut Vec<f32>, v: f32| {
+        for _ in 0..dst_ch {
+            out.push(v);
+        }
+    };
+
+    if src_rate == dst_rate {
+        let mut out = Vec::with_capacity(mono.len() * dst_ch);
+        for v in mono {
+            fan(&mut out, v);
+        }
+        return out;
+    }
+
+    let dst_frames = ((src_frames as u64 * dst_rate as u64) / src_rate as u64).max(1) as usize;
+    let ratio = src_rate as f64 / dst_rate as f64;
+    let mut out = Vec::with_capacity(dst_frames * dst_ch);
+    for j in 0..dst_frames {
+        let pos = j as f64 * ratio;
+        let i0 = pos.floor() as usize;
+        let frac = (pos - i0 as f64) as f32;
+        let a = mono[i0.min(src_frames - 1)];
+        let b = mono[(i0 + 1).min(src_frames - 1)];
+        fan(&mut out, a + (b - a) * frac);
+    }
+    out
 }
 
 /// Play already-decoded PCM on the default output device. See [`play_wav`].
@@ -101,13 +219,33 @@ fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), Whisrs
         .default_output_device()
         .ok_or_else(|| WhisrsError::Audio("no default audio output device".to_string()))?;
 
+    // Play at the device's preferred rate/channels and resample/remap the clip
+    // to match. Forcing the clip's native format (e.g. Groq's 24 kHz mono) can
+    // fail to build a stream on devices that only advertise their default rate.
+    let (target_rate, target_channels) = match device.default_output_config() {
+        Ok(cfg) => (cfg.sample_rate().0, cfg.channels().max(1)),
+        Err(e) => {
+            debug!("no default output config ({e}); using clip's native format");
+            (decoded.sample_rate, decoded.channels.max(1))
+        }
+    };
+
     let config = StreamConfig {
-        channels: decoded.channels,
-        sample_rate: SampleRate(decoded.sample_rate),
+        channels: target_channels,
+        sample_rate: SampleRate(target_rate),
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let samples = decoded.samples;
+    let samples = resample_remap(
+        &decoded.samples,
+        decoded.channels,
+        decoded.sample_rate,
+        target_channels,
+        target_rate,
+    );
+    if samples.is_empty() {
+        return Ok(());
+    }
     let samples_len = samples.len();
     let sample_idx = Arc::new(AtomicUsize::new(0));
     let sample_idx_cb = Arc::clone(&sample_idx);
@@ -149,8 +287,8 @@ fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), Whisrs
 
     // Compute a generous upper bound on playback duration so a stuck stream
     // can't block forever.
-    let frames = (samples_len / decoded.channels.max(1) as usize) as f64;
-    let clip_secs = frames / decoded.sample_rate.max(1) as f64;
+    let frames = (samples_len / target_channels.max(1) as usize) as f64;
+    let clip_secs = frames / target_rate.max(1) as f64;
     let timeout = Duration::from_secs_f64(clip_secs + 2.0);
     let start = Instant::now();
 
@@ -254,5 +392,52 @@ mod tests {
     fn decode_rejects_garbage() {
         let err = decode_wav(b"not a wav file at all").unwrap_err();
         assert!(err.to_string().contains("WAV header"));
+    }
+
+    /// A WAV streamed by ffmpeg/Lavf (as Groq returns) leaves the RIFF and data
+    /// chunk lengths as the 0xFFFFFFFF sentinel; hound rejects it raw, but
+    /// `decode_wav` repairs the lengths first.
+    #[test]
+    fn decode_repairs_streaming_sentinel_lengths() {
+        let mut wav = make_i16_wav(24_000, 1, 100);
+        let dpos = wav
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("data chunk header");
+        wav[4..8].copy_from_slice(&u32::MAX.to_le_bytes()); // RIFF size sentinel
+        wav[dpos + 4..dpos + 8].copy_from_slice(&u32::MAX.to_le_bytes()); // data size sentinel
+
+        // Raw hound rejects the sentinel data length...
+        assert!(hound::WavReader::new(Cursor::new(&wav)).is_err());
+        // ...but decode_wav repairs and reads it.
+        let decoded = decode_wav(&wav).unwrap();
+        assert_eq!(decoded.sample_rate, 24_000);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.frames(), 100);
+    }
+
+    #[test]
+    fn resample_noop_when_format_matches() {
+        let mono = vec![0.1f32, 0.2, 0.3, 0.4];
+        assert_eq!(resample_remap(&mono, 1, 16_000, 1, 16_000), mono);
+    }
+
+    #[test]
+    fn resample_changes_rate_and_upmixes_channels() {
+        // 24 kHz mono -> 48 kHz stereo: frame count doubles, channels double.
+        let mono: Vec<f32> = (0..100).map(|i| (i as f32 * 0.1).sin()).collect();
+        let out = resample_remap(&mono, 1, 24_000, 2, 48_000);
+        assert_eq!(out.len(), 200 * 2);
+        // Left/right are identical (mono fanned out).
+        assert_eq!(out[0], out[1]);
+    }
+
+    #[test]
+    fn resample_downmix_stereo_to_mono() {
+        // Interleaved stereo [1.0, -1.0, ...] downmixes to ~0.0 mono, same rate.
+        let stereo = vec![1.0f32, -1.0, 1.0, -1.0];
+        let out = resample_remap(&stereo, 2, 16_000, 1, 16_000);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| s.abs() < 1e-6));
     }
 }
