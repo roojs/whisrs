@@ -40,6 +40,10 @@ pub fn run_config_menu() -> Result<()> {
     loop {
         print_summary(&config);
 
+        // TODO(tts): add a "Text-to-speech (read aloud)" menu entry here
+        // (enable / backend / model / voice / url) once the read-aloud feature
+        // stabilizes. Skipped for now to keep this change focused; the [tts]
+        // section can still be edited via "Open in $EDITOR".
         let choices = &[
             "Backend & API keys",
             "Language",

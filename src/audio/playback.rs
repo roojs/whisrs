@@ -145,9 +145,31 @@ fn repair_streaming_wav(bytes: &[u8]) -> Option<Vec<u8>> {
 /// The stream callback advances through the decoded samples; when they are
 /// exhausted (or `stop` is set) it emits silence and signals completion. This
 /// function is intended to be run on a blocking task (`spawn_blocking`).
-pub fn play_wav(wav_bytes: &[u8], stop: Arc<AtomicBool>) -> Result<(), WhisrsError> {
+///
+/// When `level_tx` is `Some`, a normalized amplitude (0..=1) computed from each
+/// emitted buffer is published so a speaking overlay can react to the audio.
+/// The watch channel coalesces, so no throttling is needed.
+pub fn play_wav(
+    wav_bytes: &[u8],
+    stop: Arc<AtomicBool>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
+) -> Result<(), WhisrsError> {
     let decoded = decode_wav(wav_bytes)?;
-    play_decoded(decoded, stop)
+    play_decoded(decoded, stop, level_tx)
+}
+
+/// Normalized playback amplitude from a buffer of interleaved f32 samples.
+///
+/// Mirrors [`crate::audio::capture`]'s level mapping: RMS through a soft
+/// compressor `1 - exp(-rms * 18)` so typical speech reaches the upper part
+/// of the visualizer's dynamic range.
+fn playback_level(data: &[f32]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let sum_squares: f32 = data.iter().map(|s| s * s).sum();
+    let rms = (sum_squares / data.len() as f32).sqrt();
+    (1.0 - (-rms * 18.0).exp()).clamp(0.0, 1.0)
 }
 
 /// Resample interleaved f32 audio from `(src_rate, src_channels)` to
@@ -209,7 +231,11 @@ fn resample_remap(
 }
 
 /// Play already-decoded PCM on the default output device. See [`play_wav`].
-fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), WhisrsError> {
+fn play_decoded(
+    decoded: DecodedWav,
+    stop: Arc<AtomicBool>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
+) -> Result<(), WhisrsError> {
     if decoded.samples.is_empty() {
         return Ok(());
     }
@@ -253,6 +279,7 @@ fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), Whisrs
     let done_cb = Arc::clone(&done);
     let stop_cb = Arc::clone(&stop);
 
+    let level_tx_cb = level_tx.clone();
     let stream = device
         .build_output_stream(
             &config,
@@ -262,6 +289,9 @@ fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), Whisrs
                         *sample = 0.0;
                     }
                     done_cb.store(true, Ordering::Release);
+                    if let Some(tx) = &level_tx_cb {
+                        let _ = tx.send(0.0);
+                    }
                     return;
                 }
                 for sample in data.iter_mut() {
@@ -272,6 +302,11 @@ fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), Whisrs
                         *sample = 0.0;
                         done_cb.store(true, Ordering::Release);
                     }
+                }
+                // Publish the amplitude of the buffer we just emitted so a
+                // speaking overlay can react. Best-effort; watch coalesces.
+                if let Some(tx) = &level_tx_cb {
+                    let _ = tx.send(playback_level(data));
                 }
             },
             |err| {
@@ -307,6 +342,10 @@ fn play_decoded(decoded: DecodedWav, stop: Arc<AtomicBool>) -> Result<(), Whisrs
     // Let the final buffer drain.
     std::thread::sleep(Duration::from_millis(50));
     drop(stream);
+    // Reset the visualizer to silence once playback ends.
+    if let Some(tx) = &level_tx {
+        let _ = tx.send(0.0);
+    }
     Ok(())
 }
 
@@ -430,6 +469,21 @@ mod tests {
         assert_eq!(out.len(), 200 * 2);
         // Left/right are identical (mono fanned out).
         assert_eq!(out[0], out[1]);
+    }
+
+    #[test]
+    fn playback_level_silence_is_zero() {
+        assert_eq!(playback_level(&[]), 0.0);
+        assert_eq!(playback_level(&[0.0, 0.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn playback_level_loud_is_higher_than_quiet() {
+        let quiet = playback_level(&[0.01, -0.01, 0.01, -0.01]);
+        let loud = playback_level(&[0.8, -0.8, 0.8, -0.8]);
+        assert!(loud > quiet);
+        assert!((0.0..=1.0).contains(&loud));
+        assert!((0.0..=1.0).contains(&quiet));
     }
 
     #[test]

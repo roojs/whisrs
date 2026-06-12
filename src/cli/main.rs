@@ -27,6 +27,7 @@ const ASCII_BANNER: &str = concat!(
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
+const CYAN: &str = "\x1b[36m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
@@ -87,6 +88,8 @@ fn format_state(state: State, use_color: bool) -> String {
         State::Idle => format!("{BOLD}idle{RESET}"),
         State::Recording => format!("{BOLD}{GREEN}recording{RESET}"),
         State::Transcribing => format!("{BOLD}{YELLOW}transcribing{RESET}"),
+        State::Synthesizing => format!("{BOLD}{CYAN}synthesizing{RESET}"),
+        State::Speaking => format!("{BOLD}{GREEN}speaking{RESET}"),
     }
 }
 

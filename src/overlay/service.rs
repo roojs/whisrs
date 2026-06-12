@@ -122,6 +122,9 @@ struct Theme {
     ring: [u8; 4],
     rec_bar: [u8; 4],
     trans_bar: [u8; 4],
+    /// Read-aloud "speaking" bar color — a distinct hue from `rec_bar` so the
+    /// user can tell dictation from read-aloud at a glance.
+    speak_bar: [u8; 4],
     glow: [u8; 4],
 }
 
@@ -133,6 +136,7 @@ impl Theme {
             ring: [64, 249, 115, 22],        // #F97316 @ 25%
             rec_bar: [255, 249, 115, 22],    // #F97316
             trans_bar: [255, 240, 237, 245], // #F0EDF5
+            speak_bar: [255, 52, 211, 153],  // #34D399 emerald — distinct from amber
             glow: [60, 249, 115, 22],
         }
     }
@@ -144,6 +148,7 @@ impl Theme {
             ring: [80, 58, 58, 64],          // hairline gray
             rec_bar: [255, 240, 237, 245],   // soft white
             trans_bar: [255, 156, 163, 175], // warm gray
+            speak_bar: [255, 45, 212, 191],  // #2DD4BF teal — pops against the grays
             glow: [40, 240, 237, 245],
         }
     }
@@ -155,6 +160,7 @@ impl Theme {
             ring: [64, 34, 211, 238], // #22D3EE @ 25%
             rec_bar: [255, 34, 211, 238],
             trans_bar: [255, 56, 189, 248], // #38BDF8
+            speak_bar: [255, 74, 222, 128], // #4ADE80 green — distinct from cyan
             glow: [50, 34, 211, 238],
         }
     }
@@ -196,6 +202,11 @@ impl Theme {
                 .as_deref()
                 .and_then(crate::parse_hex_color)
                 .unwrap_or(base.trans_bar),
+            speak_bar: c
+                .speaking
+                .as_deref()
+                .and_then(crate::parse_hex_color)
+                .unwrap_or(base.speak_bar),
             glow: c
                 .glow
                 .as_deref()
@@ -1474,10 +1485,20 @@ fn draw_overlay(
     // visually; the bars just don't follow its center-of-mass.
     let pill_cy = surface_h / 2.0;
     match state {
-        State::Recording => draw_bars(pixmap, theme, level, anim, pill_cy),
-        State::Transcribing => draw_sweep(pixmap, theme, frame, anim, pill_cy),
+        State::Recording => draw_bars(pixmap, theme, theme.rec_bar, level, anim, pill_cy),
+        // Read-aloud playback reuses the equalizer bars in a distinct hue,
+        // driven by the spoken audio amplitude.
+        State::Speaking => draw_bars(pixmap, theme, theme.speak_bar, level, anim, pill_cy),
+        // Synthesizing reuses the transcribing "working on it" shimmer.
+        State::Transcribing | State::Synthesizing => {
+            draw_sweep(pixmap, theme, frame, anim, pill_cy)
+        }
         State::Idle => {}
     }
+    // NOTE: the external GNOME Shell extension (not in this repo) only renders
+    // recording/transcribing today; it would need a separate update to draw
+    // the synthesizing/speaking states. The native Wayland/X11 paths above
+    // handle them fully.
 }
 
 /// Build a stadium / pill path: rectangle + two end-cap circles, joined by
@@ -1567,7 +1588,14 @@ fn taper_factor(i: u32, count: u32) -> f32 {
 /// the dominant driver — only ~15 % of the bar height comes from the
 /// per-bar phase animation, so silence reads as actually quiet and loud
 /// speech reaches near the pill edge.
-fn draw_bars(pixmap: &mut Pixmap, theme: &Theme, level: f32, anim: AnimState, pill_cy: f32) {
+fn draw_bars(
+    pixmap: &mut Pixmap,
+    theme: &Theme,
+    bar_color: [u8; 4],
+    level: f32,
+    anim: AnimState,
+    pill_cy: f32,
+) {
     let surface_w = pixmap.width() as f32;
     // Track the *currently displayed* pill height so bars stay within the
     // pill while it's still growing during the spawn animation.
@@ -1620,7 +1648,7 @@ fn draw_bars(pixmap: &mut Pixmap, theme: &Theme, level: f32, anim: AnimState, pi
                 anti_alias: true,
                 ..Default::default()
             };
-            paint.set_color(theme_color(theme.rec_bar, anim.bar_alpha));
+            paint.set_color(theme_color(bar_color, anim.bar_alpha));
             pixmap.fill_path(
                 &path,
                 &paint,
@@ -1735,6 +1763,40 @@ mod tests {
         let t = Theme::ember();
         draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t);
         // tiny-skia stores premultiplied RGBA; alpha lives in the 4th byte.
+        assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
+    }
+
+    #[test]
+    fn speaking_uses_distinct_bar_color_from_recording() {
+        // Recording bars are amber (#F97316: high R, mid G, low B); speaking
+        // bars are emerald (#34D399: low R, high G, mid B). Confirm the
+        // speaking frame paints green-dominant bar pixels that the recording
+        // frame does not.
+        fn green_dominant(data: &[u8]) -> usize {
+            data.chunks_exact(4)
+                .filter(|px| px[1] > 150 && px[0] < 120 && px[1] > px[0])
+                .count()
+        }
+
+        let t = Theme::ember();
+        let mut rec = fresh_pixmap();
+        let mut spk = fresh_pixmap();
+        draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t);
+        draw_overlay(&mut spk, State::Speaking, 0, 1.0, shown(), &t);
+        let rec_green = green_dominant(rec.data());
+        let spk_green = green_dominant(spk.data());
+        assert!(
+            spk_green > rec_green,
+            "speaking should paint more green-dominant pixels than recording \
+             (recording={rec_green}, speaking={spk_green})"
+        );
+    }
+
+    #[test]
+    fn synthesizing_draws_visible_pixels() {
+        let mut pm = fresh_pixmap();
+        let t = Theme::ember();
+        draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t);
         assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
     }
 

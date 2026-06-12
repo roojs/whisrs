@@ -49,6 +49,16 @@ mod icons {
     pub fn transcribing() -> Vec<u8> {
         circle_icon(0xFF_E0_A0_20)
     }
+
+    /// Read-aloud: synthesizing speech (blue/purple).
+    pub fn synthesizing() -> Vec<u8> {
+        circle_icon(0xFF_7C_5C_FF)
+    }
+
+    /// Read-aloud: playing speech (green).
+    pub fn speaking() -> Vec<u8> {
+        circle_icon(0xFF_34_D3_99)
+    }
 }
 
 /// Shared state that the tray reads.
@@ -72,6 +82,8 @@ impl ksni::Tray for WhisrsTray {
             State::Idle => "whisrs — idle".to_string(),
             State::Recording => "whisrs — recording".to_string(),
             State::Transcribing => "whisrs — transcribing".to_string(),
+            State::Synthesizing => "whisrs — synthesizing".to_string(),
+            State::Speaking => "whisrs — speaking".to_string(),
         }
     }
 
@@ -81,6 +93,8 @@ impl ksni::Tray for WhisrsTray {
             State::Idle => icons::idle(),
             State::Recording => icons::recording(),
             State::Transcribing => icons::transcribing(),
+            State::Synthesizing => icons::synthesizing(),
+            State::Speaking => icons::speaking(),
         };
         vec![Icon {
             width: 16,
@@ -95,6 +109,8 @@ impl ksni::Tray for WhisrsTray {
             State::Idle => "Idle — ready to record",
             State::Recording => "Recording...",
             State::Transcribing => "Transcribing...",
+            State::Synthesizing => "Synthesizing…",
+            State::Speaking => "Reading aloud…",
         };
         ToolTip {
             title: "whisrs".to_string(),

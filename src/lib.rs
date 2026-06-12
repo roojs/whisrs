@@ -63,6 +63,10 @@ pub enum State {
     Idle,
     Recording,
     Transcribing,
+    /// Read-aloud: synthesizing speech from the selection (no audio yet).
+    Synthesizing,
+    /// Read-aloud: playing the synthesized speech.
+    Speaking,
 }
 
 impl std::fmt::Display for State {
@@ -71,6 +75,8 @@ impl std::fmt::Display for State {
             State::Idle => write!(f, "idle"),
             State::Recording => write!(f, "recording"),
             State::Transcribing => write!(f, "transcribing"),
+            State::Synthesizing => write!(f, "synthesizing"),
+            State::Speaking => write!(f, "speaking"),
         }
     }
 }
@@ -159,6 +165,8 @@ pub struct OverlayColors {
     pub ring: Option<String>,
     pub recording: Option<String>,
     pub transcribing: Option<String>,
+    /// Override color for the read-aloud "speaking" bars.
+    pub speaking: Option<String>,
     pub glow: Option<String>,
 }
 
@@ -346,6 +354,11 @@ pub struct TtsConfig {
     /// Whether read-selection-aloud is enabled.
     #[serde(default)]
     pub enabled: bool,
+    /// TTS backend: `"groq"` (default), `"openai"`, `"tts-sidecar"`
+    /// (alias `"openai-compat"`, for local Kokoro/Supertonic servers), or
+    /// `"deepgram"` (Aura-2).
+    #[serde(default = "default_tts_backend")]
+    pub backend: String,
     /// TTS model identifier (backend-specific).
     #[serde(default = "default_tts_model")]
     pub model: String,
@@ -355,19 +368,25 @@ pub struct TtsConfig {
     /// Audio response format requested from the API (we decode WAV).
     #[serde(default = "default_tts_response_format")]
     pub response_format: String,
-    /// Optional dedicated API key; falls back to the Groq key when absent.
+    /// Optional dedicated API key; falls back to the backend's key when absent.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Endpoint URL for the `tts-sidecar` backend (OpenAI-compatible
+    /// `/v1/audio/speech`). Ignored by other backends.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 impl Default for TtsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: default_tts_backend(),
             model: default_tts_model(),
             voice: default_tts_voice(),
             response_format: default_tts_response_format(),
             api_key: None,
+            url: None,
         }
     }
 }
@@ -424,6 +443,9 @@ fn default_groq_model() -> String {
 }
 fn default_openai_model() -> String {
     "gpt-4o-mini-transcribe".to_string()
+}
+fn default_tts_backend() -> String {
+    "groq".to_string()
 }
 fn default_tts_model() -> String {
     "canopylabs/orpheus-v1-english".to_string()
@@ -863,6 +885,56 @@ mod tests {
     }
 
     #[test]
+    fn config_tts_backend_and_url_roundtrip() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "groq"
+
+            [tts]
+            enabled = true
+            backend = "tts-sidecar"
+            model = "kokoro"
+            voice = "af_heart"
+            url = "http://127.0.0.1:8880/v1/audio/speech"
+            "#,
+        )
+        .unwrap();
+
+        let tts = config.tts.as_ref().expect("tts section parsed");
+        assert_eq!(tts.backend, "tts-sidecar");
+        assert_eq!(
+            tts.url.as_deref(),
+            Some("http://127.0.0.1:8880/v1/audio/speech")
+        );
+
+        // Round-trips back out and parses again identically.
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        let tts = reparsed.tts.unwrap();
+        assert_eq!(tts.backend, "tts-sidecar");
+        assert_eq!(
+            tts.url.as_deref(),
+            Some("http://127.0.0.1:8880/v1/audio/speech")
+        );
+    }
+
+    #[test]
+    fn config_tts_backend_defaults_to_groq() {
+        let config: Config = toml::from_str(
+            r#"
+            [general]
+            backend = "groq"
+
+            [tts]
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.tts.unwrap().backend, "groq");
+    }
+
+    #[test]
     fn config_tts_defaults_when_minimal() {
         let config: Config = toml::from_str(
             r#"
@@ -922,6 +994,23 @@ mod tests {
         assert_eq!(State::Idle.to_string(), "idle");
         assert_eq!(State::Recording.to_string(), "recording");
         assert_eq!(State::Transcribing.to_string(), "transcribing");
+        assert_eq!(State::Synthesizing.to_string(), "synthesizing");
+        assert_eq!(State::Speaking.to_string(), "speaking");
+    }
+
+    #[test]
+    fn state_serde_wire_format() {
+        // serde rename_all = "lowercase" governs the IPC wire form.
+        assert_eq!(
+            serde_json::to_string(&State::Synthesizing).unwrap(),
+            r#""synthesizing""#
+        );
+        assert_eq!(
+            serde_json::to_string(&State::Speaking).unwrap(),
+            r#""speaking""#
+        );
+        let parsed: State = serde_json::from_str(r#""speaking""#).unwrap();
+        assert_eq!(parsed, State::Speaking);
     }
 
     #[test]

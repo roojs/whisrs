@@ -1,15 +1,32 @@
 //! Text-to-speech backends: trait definition and implementations.
 //!
 //! The synthesis stage of the "read selection aloud" feature lives behind a
-//! small [`TtsBackend`] trait (mirroring [`crate::transcription::TranscriptionBackend`])
-//! so a local backend (piper/espeak) can be added later. v1 ships the Groq
-//! backend only.
+//! small [`TtsBackend`] trait (mirroring [`crate::transcription::TranscriptionBackend`]).
+//!
+//! Cloud and local-server backends are covered today:
+//! - `groq` / `openai` / `tts-sidecar` share the OpenAI `/v1/audio/speech`
+//!   request shape via [`openai_compat::OpenAiCompatTts`]. The `tts-sidecar`
+//!   backend points at any local OpenAI-compatible server (Kokoro, Supertonic,
+//!   etc.) and needs no API key.
+//! - `deepgram` uses Deepgram Aura-2 via [`deepgram_aura::DeepgramAuraTts`].
+//!
+//! Roadmap: native in-process local backends (Supertonic via ONNX/`ort`,
+//! Piper, Kokoro) are future work. Until then, those models are reachable
+//! today through a local server behind the `tts-sidecar` backend.
 
+pub mod deepgram_aura;
 pub mod groq;
+pub mod openai_compat;
 
 use async_trait::async_trait;
 
 use crate::{TtsConfig, WhisrsError};
+
+/// Default endpoint for a local OpenAI-compatible TTS sidecar (e.g. Kokoro-FastAPI).
+const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8880/v1/audio/speech";
+
+/// OpenAI's text-to-speech endpoint.
+const OPENAI_SPEECH_URL: &str = "https://api.openai.com/v1/audio/speech";
 
 /// Trait for text-to-speech backends.
 ///
@@ -23,25 +40,111 @@ pub trait TtsBackend: Send + Sync {
 
 /// Build the configured TTS backend.
 ///
-/// `api_key` should already be resolved (TTS-specific key, falling back to the
-/// Groq key / `WHISRS_GROQ_API_KEY`). Returns an error when no key is available.
-/// v1 always builds the Groq backend.
+/// `api_key` should already be resolved for the configured backend (see the
+/// daemon's `resolve_tts_api_key`). Cloud backends (`groq`, `openai`,
+/// `deepgram`) require a key; the `tts-sidecar` backend treats it as optional.
 pub fn create_backend(
     config: &TtsConfig,
     api_key: Option<String>,
 ) -> Result<Box<dyn TtsBackend>, WhisrsError> {
-    let api_key = api_key.filter(|k| !k.is_empty()).ok_or_else(|| {
-        WhisrsError::Config(
-            "TTS is enabled but no API key is configured.\n\
-             Add an api_key to [tts], or configure [groq] api_key / set WHISRS_GROQ_API_KEY."
-                .to_string(),
-        )
-    })?;
+    let api_key = api_key.filter(|k| !k.is_empty());
 
-    Ok(Box::new(groq::GroqTts::new(
-        api_key,
-        config.model.clone(),
-        config.voice.clone(),
-        config.response_format.clone(),
-    )))
+    // Require a key for the cloud backends; the sidecar can run keyless.
+    let require_key = |key: Option<String>| -> Result<String, WhisrsError> {
+        key.ok_or_else(|| {
+            WhisrsError::Config(
+                "TTS is enabled but no API key is configured.\n\
+                 Add an api_key to [tts], or configure the backend's key \
+                 (e.g. [groq] api_key / WHISRS_GROQ_API_KEY)."
+                    .to_string(),
+            )
+        })
+    };
+
+    match config.backend.as_str() {
+        "groq" => Ok(Box::new(openai_compat::OpenAiCompatTts::new(
+            groq::GROQ_SPEECH_URL.to_string(),
+            Some(require_key(api_key)?),
+            config.model.clone(),
+            config.voice.clone(),
+            config.response_format.clone(),
+        ))),
+        "openai" => Ok(Box::new(openai_compat::OpenAiCompatTts::new(
+            OPENAI_SPEECH_URL.to_string(),
+            Some(require_key(api_key)?),
+            config.model.clone(),
+            config.voice.clone(),
+            config.response_format.clone(),
+        ))),
+        "tts-sidecar" | "openai-compat" => {
+            let base_url = config
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_SIDECAR_URL)
+                .to_string();
+            Ok(Box::new(openai_compat::OpenAiCompatTts::new(
+                base_url,
+                api_key, // optional — sidecars usually need none
+                config.model.clone(),
+                config.voice.clone(),
+                config.response_format.clone(),
+            )))
+        }
+        "deepgram" => Ok(Box::new(deepgram_aura::DeepgramAuraTts::new(
+            require_key(api_key)?,
+            config.model.clone(),
+        ))),
+        other => Err(WhisrsError::Config(format!(
+            "Unknown TTS backend '{other}'. Valid options: groq, openai, tts-sidecar, deepgram"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(backend: &str) -> TtsConfig {
+        TtsConfig {
+            enabled: true,
+            backend: backend.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn create_groq_backend_requires_key() {
+        assert!(create_backend(&cfg("groq"), Some("k".to_string())).is_ok());
+        assert!(create_backend(&cfg("groq"), None).is_err());
+    }
+
+    #[test]
+    fn create_openai_backend_requires_key() {
+        assert!(create_backend(&cfg("openai"), Some("k".to_string())).is_ok());
+        assert!(create_backend(&cfg("openai"), None).is_err());
+    }
+
+    #[test]
+    fn create_deepgram_backend_requires_key() {
+        assert!(create_backend(&cfg("deepgram"), Some("k".to_string())).is_ok());
+        assert!(create_backend(&cfg("deepgram"), None).is_err());
+    }
+
+    #[test]
+    fn create_sidecar_backend_allows_no_key() {
+        // Sidecar must build with no key; alias must also work.
+        assert!(create_backend(&cfg("tts-sidecar"), None).is_ok());
+        assert!(create_backend(&cfg("openai-compat"), None).is_ok());
+    }
+
+    #[test]
+    fn create_unknown_backend_errors() {
+        // `Box<dyn TtsBackend>` isn't Debug, so match instead of unwrap_err().
+        match create_backend(&cfg("bogus"), Some("k".to_string())) {
+            Err(e) => assert!(e.to_string().contains("Unknown TTS backend")),
+            Ok(_) => panic!("expected an error for an unknown backend"),
+        }
+    }
 }
