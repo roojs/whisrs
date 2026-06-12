@@ -11,7 +11,7 @@ members = [
 
 [package]
 name = "whisrs"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 description = "Linux-first voice-to-text dictation tool with Groq, OpenAI, and local Whisper backends"
 license = "MIT"
@@ -45,7 +45,7 @@ asr-dedup = { path = "crates/asr-dedup", version = "0.1" }
 audio-silence-gate = { path = "crates/audio-silence-gate", version = "0.1" }
 filler-remove = { path = "crates/filler-remove", version = "0.1" }
 prompt-echo = { path = "crates/prompt-echo", version = "0.1" }
-xkb-type = { path = "crates/xkb-type", version = "0.1.1", features = ["arboard", "wayland-vk"] }
+xkb-type = { path = "crates/xkb-type", version = "0.1.2", features = ["arboard", "wayland-vk"] }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
