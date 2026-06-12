@@ -359,12 +359,15 @@ pub struct TtsConfig {
     /// `"deepgram"` (Aura-2).
     #[serde(default = "default_tts_backend")]
     pub backend: String,
-    /// TTS model identifier (backend-specific).
-    #[serde(default = "default_tts_model")]
-    pub model: String,
-    /// Voice name.
-    #[serde(default = "default_tts_voice")]
-    pub voice: String,
+    /// TTS model identifier (backend-specific). When omitted, each backend
+    /// applies its own sensible default (see [`crate::tts::create_backend`]),
+    /// so switching `backend` works without also hand-editing the model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Voice name (backend-specific). When omitted, the backend's default
+    /// voice is used.
+    #[serde(default)]
+    pub voice: Option<String>,
     /// Audio response format requested from the API (we decode WAV).
     #[serde(default = "default_tts_response_format")]
     pub response_format: String,
@@ -382,8 +385,8 @@ impl Default for TtsConfig {
         Self {
             enabled: false,
             backend: default_tts_backend(),
-            model: default_tts_model(),
-            voice: default_tts_voice(),
+            model: None,
+            voice: None,
             response_format: default_tts_response_format(),
             api_key: None,
             url: None,
@@ -446,12 +449,6 @@ fn default_openai_model() -> String {
 }
 fn default_tts_backend() -> String {
     "groq".to_string()
-}
-fn default_tts_model() -> String {
-    "canopylabs/orpheus-v1-english".to_string()
-}
-fn default_tts_voice() -> String {
-    "autumn".to_string()
 }
 fn default_tts_response_format() -> String {
     "wav".to_string()
@@ -873,8 +870,8 @@ mod tests {
 
         let tts = config.tts.as_ref().expect("tts section parsed");
         assert!(tts.enabled);
-        assert_eq!(tts.model, "canopylabs/orpheus-v1-english");
-        assert_eq!(tts.voice, "autumn");
+        assert_eq!(tts.model.as_deref(), Some("canopylabs/orpheus-v1-english"));
+        assert_eq!(tts.voice.as_deref(), Some("autumn"));
         assert_eq!(tts.response_format, "wav");
         assert!(tts.api_key.is_none());
 
@@ -949,9 +946,11 @@ mod tests {
 
         let tts = config.tts.unwrap();
         assert!(tts.enabled);
-        // Defaults applied for omitted fields.
-        assert_eq!(tts.model, "canopylabs/orpheus-v1-english");
-        assert_eq!(tts.voice, "autumn");
+        // model/voice are left unset in config — each backend supplies its own
+        // default at build time (see tts::create_backend), so switching backend
+        // doesn't require also overriding the model.
+        assert!(tts.model.is_none());
+        assert!(tts.voice.is_none());
         assert_eq!(tts.response_format, "wav");
     }
 

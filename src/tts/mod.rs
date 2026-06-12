@@ -28,6 +28,17 @@ const DEFAULT_SIDECAR_URL: &str = "http://127.0.0.1:8880/v1/audio/speech";
 /// OpenAI's text-to-speech endpoint.
 const OPENAI_SPEECH_URL: &str = "https://api.openai.com/v1/audio/speech";
 
+// Per-backend default model/voice, applied when `[tts] model`/`voice` are unset
+// so a user can switch `backend` without also overriding the model. The Groq
+// default (orpheus) is meaningless to OpenAI/Deepgram, which is why the default
+// is resolved here per backend rather than baked into the config.
+const GROQ_DEFAULT_MODEL: &str = "canopylabs/orpheus-v1-english";
+const GROQ_DEFAULT_VOICE: &str = "autumn";
+const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini-tts";
+const OPENAI_DEFAULT_VOICE: &str = "alloy";
+const SIDECAR_DEFAULT_MODEL: &str = "kokoro";
+const SIDECAR_DEFAULT_VOICE: &str = "af_heart";
+
 /// Trait for text-to-speech backends.
 ///
 /// Each backend takes input text and returns synthesized speech as WAV bytes,
@@ -61,19 +72,40 @@ pub fn create_backend(
         })
     };
 
+    // Resolve the effective model/voice: the configured value when present and
+    // non-blank, otherwise the selected backend's default.
+    let model_or = |default: &str| -> String {
+        config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+    let voice_or = |default: &str| -> String {
+        config
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+
     match config.backend.as_str() {
         "groq" => Ok(Box::new(openai_compat::OpenAiCompatTts::new(
             groq::GROQ_SPEECH_URL.to_string(),
             Some(require_key(api_key)?),
-            config.model.clone(),
-            config.voice.clone(),
+            model_or(GROQ_DEFAULT_MODEL),
+            voice_or(GROQ_DEFAULT_VOICE),
             config.response_format.clone(),
         ))),
         "openai" => Ok(Box::new(openai_compat::OpenAiCompatTts::new(
             OPENAI_SPEECH_URL.to_string(),
             Some(require_key(api_key)?),
-            config.model.clone(),
-            config.voice.clone(),
+            model_or(OPENAI_DEFAULT_MODEL),
+            voice_or(OPENAI_DEFAULT_VOICE),
             config.response_format.clone(),
         ))),
         "tts-sidecar" | "openai-compat" => {
@@ -87,14 +119,14 @@ pub fn create_backend(
             Ok(Box::new(openai_compat::OpenAiCompatTts::new(
                 base_url,
                 api_key, // optional — sidecars usually need none
-                config.model.clone(),
-                config.voice.clone(),
+                model_or(SIDECAR_DEFAULT_MODEL),
+                voice_or(SIDECAR_DEFAULT_VOICE),
                 config.response_format.clone(),
             )))
         }
         "deepgram" => Ok(Box::new(deepgram_aura::DeepgramAuraTts::new(
             require_key(api_key)?,
-            config.model.clone(),
+            model_or(deepgram_aura::DEFAULT_MODEL),
         ))),
         other => Err(WhisrsError::Config(format!(
             "Unknown TTS backend '{other}'. Valid options: groq, openai, tts-sidecar, deepgram"
