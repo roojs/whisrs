@@ -29,7 +29,7 @@ Initializes the selected transcription backend
 .IP \(bu 2
 Binds the Unix domain socket and begins accepting commands
 .SH STATE MACHINE
-The daemon maintains one of three states:
+The daemon maintains one of five states:
 .TP
 .B idle
 Waiting for a toggle command. No audio is being captured.
@@ -41,6 +41,12 @@ command transitions out of this state.
 .B transcribing
 Audio has been sent to the transcription backend. The daemon is waiting
 for results. Text is typed at the cursor as it becomes available.
+.TP
+.B synthesizing
+Read-aloud: generating speech from the selected text.
+.TP
+.B speaking
+Read-aloud: playing synthesized speech; a second speak or a cancel stops it.
 .SH TRANSCRIPTION BACKENDS
 .TP
 .B groq

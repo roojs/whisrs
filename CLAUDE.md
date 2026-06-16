@@ -32,6 +32,7 @@ systemctl --user enable --now whisrs.service
 # Use the CLI (bind to a hotkey)
 whisrs toggle    # start/stop recording
 whisrs cancel    # cancel and discard audio
+whisrs speak     # read the selected text aloud via TTS (alias: read; press again to stop)
 whisrs status    # query daemon state
 whisrs restart   # restart the daemon (wraps systemctl --user when present)
 
@@ -70,6 +71,11 @@ src/
 │   ├── local_vosk.rs       # Vosk backend stub (coming soon)
 │   ├── local_parakeet.rs   # Parakeet/NVIDIA backend stub (coming soon)
 │   └── dedup.rs            # Timestamp + n-gram deduplication for chunked APIs
+├── tts/
+│   ├── mod.rs              # TtsBackend trait + create_backend (read selection aloud)
+│   ├── groq.rs             # Groq TTS (OpenAI-compatible /v1/audio/speech)
+│   ├── openai_compat.rs    # OpenAI + tts-sidecar (local OpenAI-compatible server)
+│   └── deepgram_aura.rs    # Deepgram Aura-2 TTS (voice encoded in model id)
 ├── input/
 │   ├── mod.rs              # KeyInjector trait
 │   ├── uinput.rs           # Virtual keyboard via evdev UinputDevice
@@ -84,7 +90,8 @@ src/
 ├── config/
 │   ├── mod.rs              # Config module exports
 │   └── setup.rs            # Interactive onboarding (whisrs setup)
-└── state.rs                # State machine (Idle → Recording → Transcribing → Idle)
+└── state.rs                # State machine (Idle → Recording → Transcribing → Idle;
+                            #   read-aloud: Idle → Synthesizing → Speaking → Idle)
 ```
 
 ### Supporting Files
@@ -128,12 +135,14 @@ Responses: `{"status": "ok", "state": "idle"}`, `{"status": "error", "message": 
 
 Path: `~/.config/whisrs/config.toml` (permissions: 0600)
 
-Backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realtime`, `openai`, `local-whisper`, `local-vosk`, `local-parakeet`, `asr-sidecar`
+Transcription backends: `deepgram`, `deepgram-streaming`, `groq`, `openai-realtime`, `openai`, `local-whisper`, `local-vosk`, `local-parakeet`, `asr-sidecar`
+
+TTS (read selection aloud): the `[tts]` section (`enabled` off by default) drives `whisrs speak` / `read` and `[hotkeys] speak`. Backends: `groq`, `openai`, `deepgram`, `tts-sidecar` (local OpenAI-compatible server, alias `openai-compat`). The TTS key falls back to the matching transcription key (`[groq]`/`[openai]`/`[deepgram]`) unless `[tts] api_key` is set; `tts-sidecar` needs none.
 
 Environment variable overrides:
-- `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key`
-- `WHISRS_GROQ_API_KEY` — overrides `[groq] api_key`
-- `WHISRS_OPENAI_API_KEY` — overrides `[openai] api_key`
+- `WHISRS_DEEPGRAM_API_KEY` — overrides `[deepgram] api_key` (also used by the `deepgram` TTS backend)
+- `WHISRS_GROQ_API_KEY` — overrides `[groq] api_key` (also used by the `groq` TTS backend)
+- `WHISRS_OPENAI_API_KEY` — overrides `[openai] api_key` (also used by the `openai` TTS backend)
 - `RUST_LOG` — controls daemon log verbosity
 
 ## CI Checks

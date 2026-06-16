@@ -35,11 +35,14 @@ height = 40                 # 36..=48 (clamped)
 
 # When theme = "custom", these override the named theme. Hex strings:
 # #RGB, #RRGGBB, or #RRGGBBAA. Anything missing falls back to carbon.
+# The transcribing color is reused for the read-aloud synthesizing sweep;
+# speaking overrides the read-aloud audio-reactive bar color.
 # [overlay.colors]
 # background   = "#0E0E10EB"
 # ring         = "#3A3A4050"
 # recording    = "#F0EDF5"
 # transcribing = "#9CA3AF"
+# speaking     = "#5EEAD4"
 # glow         = "#F0EDF5"
 
 [audio]
@@ -80,11 +83,29 @@ api_key = "sk-..."
 model = "gpt-4o-mini"
 api_url = "https://api.openai.com/v1/chat/completions"
 
+# Text-to-speech: read the current selection aloud (`whisrs speak`).
+# Opt-in. model/voice are optional; each backend has its own default,
+# so switching `backend` works without re-editing model/voice.
+[tts]
+enabled = false             # off by default
+backend = "groq"            # groq | openai | deepgram | tts-sidecar
+# model = "..."             # optional; backend default when unset.
+#                           #   groq: canopylabs/orpheus-v1-english, openai: gpt-4o-mini-tts,
+#                           #   deepgram: aura-2-thalia-en, tts-sidecar: kokoro
+# voice = "..."             # optional; backend default (groq: autumn, openai: alloy,
+#                           #   tts-sidecar: af_heart). Ignored by deepgram (voice is in the model id).
+response_format = "wav"     # audio format requested from the API
+# api_key = "..."           # optional; falls back to the backend's transcription key
+#                           #   ([groq]/[openai]/[deepgram]). tts-sidecar needs none.
+# url = "http://127.0.0.1:8880/v1/audio/speech"  # tts-sidecar only: local
+#                           #   OpenAI-compatible server (Kokoro, Supertonic, ...)
+
 # Built-in global hotkeys (optional, works without WM keybinds)
 [hotkeys]
 toggle = "Super+Shift+W"
 cancel = "Super+Shift+D"
 command = "Super+Shift+G"
+speak = "Super+Shift+R"
 ```
 
 ## Environment variables
@@ -94,6 +115,8 @@ The following variables override the matching `api_key` in `config.toml`:
 - `WHISRS_GROQ_API_KEY`
 - `WHISRS_DEEPGRAM_API_KEY`
 - `WHISRS_OPENAI_API_KEY`
+
+These provider keys are also used by the matching TTS backend (`groq`/`openai`/`deepgram`) unless `[tts] api_key` is set. The `tts-sidecar` backend needs no key.
 
 `RUST_LOG` controls daemon log verbosity (e.g. `RUST_LOG=debug whisrsd`).
 

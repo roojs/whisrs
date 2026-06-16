@@ -66,6 +66,12 @@ historical record; current development happens against the v0.1.x patch line.
 
 ---
 
+## Read selection aloud (TTS) ✓
+
+- [x] **Read-selection-aloud (TTS)**: New `whisrs speak` command (alias `read`, plus `[hotkeys] speak`) reads the current text selection aloud. Press speak again or `whisrs cancel` to stop playback. Configured via the `[tts]` section (`enabled` off by default). Backends: `groq`, `openai`, `deepgram`, and a local OpenAI-compatible `tts-sidecar` (Kokoro, Supertonic, etc.). `model`/`voice` are optional and default per backend; the TTS key falls back to the matching transcription key unless `[tts] api_key` is set. Adds `synthesizing` and `speaking` daemon states, reflected in the tray icon and the overlay (a sweep while synthesizing, distinct-colored audio-reactive bars while speaking, with a `[overlay.colors] speaking` override).
+
+---
+
 ## Upcoming
 
 - [ ] **Local Vosk backend**: CPU-only local speech recognition via `vosk` crate — true streaming, small models (~40 MB), works on Intel (no GPU required)

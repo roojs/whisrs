@@ -39,12 +39,22 @@ cursor in the previously focused window.
 Cancel the current recording and discard captured audio. Returns the
 daemon to the idle state. Has no effect if the daemon is not recording.
 .TP
+.B speak
+Read the current text selection aloud via text-to-speech. A second
+.B speak
+or a
+.B cancel
+stops playback. Alias:
+.BR read .
+.TP
 .B status
 Query the daemon state. Prints one of:
 .BR idle ,
 .BR recording ,
+.BR transcribing ,
+.BR synthesizing ,
 or
-.BR transcribing .
+.BR speaking .
 .TP
 .B restart
 Restart the whisrs daemon. Uses

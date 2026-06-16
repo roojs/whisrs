@@ -124,6 +124,9 @@ pub fn create_backend(
                 config.response_format.clone(),
             )))
         }
+        // `[tts] voice` is intentionally not passed here: Aura encodes the
+        // voice in the model id (e.g. `aura-2-thalia-en`), so the model alone
+        // selects the voice.
         "deepgram" => Ok(Box::new(deepgram_aura::DeepgramAuraTts::new(
             require_key(api_key)?,
             model_or(deepgram_aura::DEFAULT_MODEL),

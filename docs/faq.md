@@ -12,6 +12,9 @@ Six backends: Groq (cloud, free tier), Deepgram Nova REST and Streaming (cloud, 
 **How does whisrs type text into applications?**
 whisrs creates a virtual keyboard using Linux's uinput subsystem and performs XKB reverse lookups to find the correct keycode and modifier combination for each character. This means it respects your keyboard layout and works in any application, including terminals, editors, and browsers.
 
+**Can whisrs read text back to me?**
+Yes. Select some text, then run `whisrs speak` (alias `read`, or bind `[hotkeys] speak`) and whisrs reads the selection aloud. Press the speak hotkey again or run `whisrs cancel` to stop playback. Supported backends are Groq, OpenAI, Deepgram, and a local OpenAI-compatible `tts-sidecar` (Kokoro, Supertonic, etc.). It is off by default; enable it with `[tts] enabled = true`.
+
 **Is whisrs a replacement for Wispr Flow or Superwhisper on Linux?**
 Yes. Wispr Flow ships clients for macOS and Windows; Superwhisper is macOS-only. Neither has a Linux client. whisrs brings the same workflow to Linux: press a hotkey, speak, and text appears at your cursor. It supports both cloud and local transcription backends.
 

@@ -382,11 +382,12 @@ fn resolve_groq_api_key(config: &Config) -> Option<String> {
 /// Resolve the API key used for TTS.
 ///
 /// The dedicated `[tts] api_key` always wins. Otherwise the key is resolved
-/// per the configured `[tts] backend`:
-/// - `openai`      → OpenAI key
-/// - `deepgram`    → Deepgram key
-/// - `tts-sidecar` → no key (local servers usually need none)
-/// - `groq` (else) → Groq key
+/// per the configured `[tts] backend`, falling back to that provider's
+/// transcription key (env var or `config.toml`):
+/// - `groq`                       → Groq key (`[groq]` / `WHISRS_GROQ_API_KEY`)
+/// - `openai`                     → OpenAI key (`[openai]` / `WHISRS_OPENAI_API_KEY`)
+/// - `deepgram`                   → Deepgram key (`[deepgram]` / `WHISRS_DEEPGRAM_API_KEY`)
+/// - `tts-sidecar` / `openai-compat` → no key (local servers usually need none)
 fn resolve_tts_api_key(config: &Config) -> Option<String> {
     if let Some(tts) = &config.tts {
         if let Some(key) = tts.api_key.as_ref().filter(|k| !k.is_empty()) {

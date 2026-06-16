@@ -15,7 +15,7 @@
 
 **Linux-first voice-to-text dictation tool, written in Rust.**
 
-Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source.
+Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. It can also read the selected text back aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar).
 
 ---
 
@@ -195,6 +195,7 @@ whisrs cancel    # Cancel recording, discard audio
 whisrs status    # Query daemon state
 whisrs restart   # Restart the daemon (uses the systemd user service when present)
 whisrs command   # Command mode: select text + speak instruction → LLM rewrite
+whisrs speak     # Read the selected text aloud (alias: whisrs read; press again to stop)
 whisrs log       # Show recent transcription history
 whisrs log -n 5  # Show last 5 entries
 whisrs log --clear  # Clear all history
@@ -221,7 +222,7 @@ whisrs log --clear  # Clear all history
 
 ## Project Status
 
-whisrs is functional and usable for daily dictation. Streaming transcription, command mode, multi-language support, system tray, OSD overlay, layout-aware injection (incl. AltGr + dead keys), the generic ASR sidecar backend (Moonshine, Parakeet, VibeVoice-ASR), and packaging for AUR / Nix / crates.io all ship today. Native local Vosk and Parakeet backends are next.
+whisrs is functional and usable for daily dictation. Streaming transcription, command mode, read-selection-aloud (TTS via Groq, OpenAI, Deepgram, or a local sidecar), multi-language support, system tray, OSD overlay, layout-aware injection (incl. AltGr + dead keys), the generic ASR sidecar backend (Moonshine, Parakeet, VibeVoice-ASR), and packaging for AUR / Nix / crates.io all ship today. Native local Vosk and Parakeet backends are next.
 
 Per-release details: [docs/version-roadmap.md](docs/version-roadmap.md).
 
