@@ -86,12 +86,19 @@ fn inference_thread_count() -> i32 {
         .min(8)
 }
 
-fn configure_full_params(
-    params: &mut whisper_rs::FullParams<'_, '_>,
+/// Run whisper inference on an audio window, reusing an existing state when
+/// provided.
+fn run_whisper_inference_on_state(
+    state: &mut whisper_rs::WhisperState,
+    audio: &[f32],
     language: &str,
     prompt: Option<&str>,
     streaming: bool,
-) {
+) -> anyhow::Result<String> {
+    use whisper_rs::{FullParams, SamplingStrategy};
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+
     if language != "auto" {
         params.set_language(Some(language));
     }
@@ -113,21 +120,6 @@ fn configure_full_params(
         // Match whisper-stream: one segment per window for lower decode latency.
         params.set_single_segment(true);
     }
-}
-
-/// Run whisper inference on an audio window, reusing an existing state when
-/// provided.
-fn run_whisper_inference_on_state(
-    state: &mut whisper_rs::WhisperState,
-    audio: &[f32],
-    language: &str,
-    prompt: Option<&str>,
-    streaming: bool,
-) -> anyhow::Result<String> {
-    use whisper_rs::{FullParams, SamplingStrategy};
-
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    configure_full_params(&mut params, language, prompt, streaming);
 
     state
         .full(params, audio)
