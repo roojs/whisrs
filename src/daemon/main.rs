@@ -913,6 +913,10 @@ async fn handle_toggle(
                 let pipeline_key_delay =
                     std::time::Duration::from_millis(context.config.input.key_delay_ms);
                 let pipeline_injector_backend = context.config.input.backend;
+                let pipeline_buffer_countdown = context
+                    .config
+                    .input
+                    .buffer_countdown_for_backend(&pipeline_backend_name);
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -934,6 +938,7 @@ async fn handle_toggle(
                         pipeline_state_tx,
                         pipeline_key_delay,
                         pipeline_injector_backend,
+                        pipeline_buffer_countdown,
                     )
                     .await
                 });
@@ -1127,6 +1132,7 @@ async fn run_streaming_pipeline(
     state_tx: tokio::sync::watch::Sender<State>,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
+    buffer_countdown: bool,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -1162,6 +1168,7 @@ async fn run_streaming_pipeline(
         let mut full_text = String::new();
         let mut focused = false;
         let batch_delay = std::time::Duration::from_millis(150);
+        let mut first_chunk = true;
 
         // The daemon text channel is intentionally append-only. For OpenAI
         // realtime this still feels token-by-token because the backend emits
@@ -1169,8 +1176,22 @@ async fn run_streaming_pipeline(
         // layer only forwards completed utterances, so this loop naturally
         // types phrase-sized chunks without needing any replacement semantics.
         loop {
-            // Wait for the first delta (blocking).
-            let first = text_rx.recv().await;
+            // Wait for the first delta (blocking). Local whisper may show an
+            // in-field "Buffering N…" countdown while the first window runs.
+            let first = if first_chunk && buffer_countdown {
+                recv_first_text_with_buffer_countdown(
+                    &mut text_rx,
+                    &wid,
+                    &window_tracker,
+                    &mut focused,
+                    key_delay,
+                    injector_backend,
+                )
+                .await
+            } else {
+                text_rx.recv().await
+            };
+            first_chunk = false;
             let Some(first) = first else { break };
 
             // Collect this delta and any others that arrive within the batch window.
@@ -1566,6 +1587,144 @@ fn format_api_error(err: &anyhow::Error) -> String {
         return "Cannot reach API — check your internet connection".to_string();
     }
     msg
+}
+
+fn backspace_at_cursor(
+    count: usize,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+    let mut keyboard_guard = keyboard_slot
+        .lock()
+        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+
+    if keyboard_guard.is_none() {
+        *keyboard_guard = Some(new_keyboard(
+            key_delay, /* prewarm = */ false, backend,
+        )?);
+    }
+
+    let keyboard = keyboard_guard
+        .as_mut()
+        .expect("keyboard exists after initialization");
+    keyboard.set_key_delay(key_delay);
+
+    let result = keyboard
+        .backspace(count)
+        .context("failed to backspace typed text");
+    if result.is_err() {
+        *keyboard_guard = None;
+    }
+    result?;
+    Ok(())
+}
+
+async fn focus_window_for_typing(
+    window_id: &Option<String>,
+    window_tracker: &Arc<dyn WindowTracker>,
+    focused: &mut bool,
+) {
+    if *focused {
+        return;
+    }
+    if let Some(wid) = window_id {
+        let wid_clone = wid.clone();
+        let tracker = Arc::clone(window_tracker);
+        if let Err(e) = tracker.focus_window(&wid_clone) {
+            warn!("failed to refocus window {wid_clone} before typing: {e}");
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    *focused = true;
+}
+
+async fn clear_buffer_countdown_hint(
+    current_hint: &mut Option<String>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) {
+    let Some(hint) = current_hint.take() else {
+        return;
+    };
+    let count = hint.chars().count();
+    match tokio::task::spawn_blocking(move || {
+        backspace_at_cursor(count, key_delay, injector_backend)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("failed to clear buffering hint: {e:#}"),
+        Err(e) => warn!("failed to join backspace task for buffering hint: {e}"),
+    }
+}
+
+async fn show_buffer_countdown_hint(
+    n: u32,
+    current_hint: &mut Option<String>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) -> bool {
+    clear_buffer_countdown_hint(current_hint, key_delay, injector_backend).await;
+    let hint = format!("Buffering {n}...");
+    let hint_for_type = hint.clone();
+    match tokio::task::spawn_blocking(move || {
+        type_text_at_cursor(&hint_for_type, key_delay, injector_backend)
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            *current_hint = Some(hint);
+            true
+        }
+        Ok(Err(e)) => {
+            warn!("failed to type buffering hint: {e:#}");
+            false
+        }
+        Err(e) => {
+            warn!("failed to join typing task for buffering hint: {e}");
+            false
+        }
+    }
+}
+
+/// Wait for the first transcription chunk, optionally typing a 3-2-1 countdown
+/// at the cursor so the user sees progress in the target input field.
+async fn recv_first_text_with_buffer_countdown(
+    text_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    window_id: &Option<String>,
+    window_tracker: &Arc<dyn WindowTracker>,
+    focused: &mut bool,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) -> Option<String> {
+    let mut current_hint: Option<String> = None;
+    let mut hints_enabled = true;
+
+    for n in [3_u32, 2, 1] {
+        focus_window_for_typing(window_id, window_tracker, focused).await;
+        if hints_enabled {
+            hints_enabled =
+                show_buffer_countdown_hint(n, &mut current_hint, key_delay, injector_backend).await;
+        }
+
+        tokio::select! {
+            text = text_rx.recv() => {
+                clear_buffer_countdown_hint(&mut current_hint, key_delay, injector_backend).await;
+                return text;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+
+    let text = text_rx.recv().await;
+    clear_buffer_countdown_hint(&mut current_hint, key_delay, injector_backend).await;
+    text
 }
 
 /// Type text at the cursor using uinput (keyboard injection) or clipboard paste.

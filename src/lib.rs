@@ -338,6 +338,22 @@ pub struct InputConfig {
     /// backend can only emit characters present in the active XKB layout.
     #[serde(default)]
     pub backend: InjectorBackend,
+    /// Type a `Buffering N…` countdown at the cursor while waiting for the
+    /// first transcription chunk. `None` (default) enables this for
+    /// `local-whisper` only; set `false` to disable or `true` to force on.
+    #[serde(default)]
+    pub buffer_countdown: Option<bool>,
+}
+
+impl InputConfig {
+    /// Whether to show the in-field buffering countdown for a backend.
+    pub fn buffer_countdown_for_backend(&self, backend: &str) -> bool {
+        match self.buffer_countdown {
+            Some(true) => true,
+            Some(false) => false,
+            None => matches!(backend, "local-whisper" | "local"),
+        }
+    }
 }
 
 impl Default for InputConfig {
@@ -345,6 +361,7 @@ impl Default for InputConfig {
         Self {
             key_delay_ms: default_key_delay_ms(),
             backend: InjectorBackend::default(),
+            buffer_countdown: None,
         }
     }
 }
@@ -1246,6 +1263,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input.backend, InjectorBackend::WaylandVk);
+    }
+
+    #[test]
+    fn input_config_buffer_countdown_auto_for_local_whisper() {
+        let input = InputConfig::default();
+        assert!(input.buffer_countdown_for_backend("local-whisper"));
+        assert!(!input.buffer_countdown_for_backend("groq"));
+
+        let mut forced_off = input.clone();
+        forced_off.buffer_countdown = Some(false);
+        assert!(!forced_off.buffer_countdown_for_backend("local-whisper"));
+
+        let mut forced_on = input;
+        forced_on.buffer_countdown = Some(true);
+        assert!(forced_on.buffer_countdown_for_backend("groq"));
     }
 
     #[test]

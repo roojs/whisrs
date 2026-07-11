@@ -19,19 +19,14 @@ use super::{TranscriptionBackend, TranscriptionConfig};
 use crate::audio::AudioChunk;
 
 /// Sliding window parameters for pseudo-streaming.
-///
-/// Aligned with whisper.cpp `whisper-stream` (500 ms step, ~3 s context) for
-/// lower latency; a 1 s first window improves time-to-first-token.
-const WINDOW_SECS: usize = 3;
-const STEP_MS: usize = 500;
+const WINDOW_SECS: usize = 5;
+const STEP_SECS: usize = 1;
 const SAMPLE_RATE: usize = 16_000;
 const WINDOW_SAMPLES: usize = WINDOW_SECS * SAMPLE_RATE;
-const STEP_SAMPLES: usize = STEP_MS * SAMPLE_RATE / 1000;
+const STEP_SAMPLES: usize = STEP_SECS * SAMPLE_RATE;
 /// Shorter initial window for faster first result.
-const INITIAL_WINDOW_SECS: usize = 1;
+const INITIAL_WINDOW_SECS: usize = 2;
 const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
-/// Whisper mel frames are 10 ms (16 kHz / hop 160).
-const WHISPER_FRAME_MS: usize = 10;
 
 /// Silence threshold — must match or be below the daemon's auto-stop threshold
 /// (0.003) so we never skip windows that auto-stop considers speech.
@@ -152,12 +147,6 @@ fn inference_thread_count() -> i32 {
         .min(8)
 }
 
-fn streaming_audio_ctx(sample_count: usize) -> i32 {
-    let window_ms = sample_count.saturating_mul(1000) / SAMPLE_RATE;
-    let frames = window_ms.div_ceil(WHISPER_FRAME_MS);
-    frames.max(1) as i32
-}
-
 /// Run whisper inference on an audio window, reusing an existing state when
 /// provided.
 fn run_whisper_inference_on_state(
@@ -180,6 +169,8 @@ fn run_whisper_inference_on_state(
             params.set_initial_prompt(prompt);
         }
     }
+    // Keep whisper context across windows; initial_prompt maintains consistency.
+    params.set_no_context(false);
 
     params.set_print_special(false);
     params.set_print_progress(false);
@@ -188,12 +179,7 @@ fn run_whisper_inference_on_state(
     params.set_n_threads(inference_thread_count());
 
     if streaming {
-        // Match whisper-stream: faster decode, prompt carries cross-window context.
-        params.set_no_context(true);
         params.set_single_segment(true);
-        params.set_audio_ctx(streaming_audio_ctx(audio.len()));
-    } else {
-        params.set_no_context(false);
     }
 
     state
@@ -280,22 +266,6 @@ async fn process_stream_window(
     }
 }
 
-/// If inference fell behind real-time audio, skip stale windows and jump to
-/// the latest step boundary so we type recent speech instead of a backlog.
-fn coalesce_stale_windows(buffer_len: usize, next_process_at: usize) -> usize {
-    let lag = buffer_len.saturating_sub(next_process_at);
-    if lag <= STEP_SAMPLES {
-        return next_process_at;
-    }
-
-    let steps_behind = lag / STEP_SAMPLES;
-    let skip = steps_behind.saturating_sub(1) * STEP_SAMPLES;
-    if skip > 0 {
-        debug!("coalescing whisper windows: skipping {skip} samples ({steps_behind} steps behind)");
-    }
-    next_process_at + skip
-}
-
 #[async_trait]
 impl TranscriptionBackend for LocalWhisperBackend {
     async fn transcribe(
@@ -353,11 +323,6 @@ impl TranscriptionBackend for LocalWhisperBackend {
             buffer.extend_from_slice(&chunk);
 
             while buffer.len() >= next_process_at {
-                next_process_at = coalesce_stale_windows(buffer.len(), next_process_at);
-                if buffer.len() < next_process_at {
-                    break;
-                }
-
                 let window_size = if last_processed_end == 0 {
                     INITIAL_WINDOW_SAMPLES.min(buffer.len())
                 } else {
@@ -447,12 +412,5 @@ mod tests {
         assert_eq!(f32_samples[0], 0.0);
         assert!((f32_samples[1] - 1.0).abs() < 0.001);
         assert!((f32_samples[2] + 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn coalesce_skips_stale_steps() {
-        assert_eq!(coalesce_stale_windows(16_000, 8_000), 8_000);
-        // 3 steps behind → skip 2 steps.
-        assert_eq!(coalesce_stale_windows(24_000, 8_000), 16_000);
     }
 }
