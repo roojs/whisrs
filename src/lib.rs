@@ -338,21 +338,18 @@ pub struct InputConfig {
     /// backend can only emit characters present in the active XKB layout.
     #[serde(default)]
     pub backend: InjectorBackend,
-    /// Type a `Buffering N…` countdown at the cursor while waiting for the
-    /// first transcription chunk. `None` (default) enables this for
-    /// `local-whisper` only; set `false` to disable or `true` to force on.
+    /// Experimental: show in-field status at the cursor while recording:
+    /// `Silence...` until you start speaking, then `Buffering N...` while
+    /// waiting for the first transcript. Keep the cursor in your target field
+    /// for the whole recording. Opt in with `buffer_countdown = true`.
     #[serde(default)]
     pub buffer_countdown: Option<bool>,
 }
 
 impl InputConfig {
     /// Whether to show the in-field buffering countdown for a backend.
-    pub fn buffer_countdown_for_backend(&self, backend: &str) -> bool {
-        match self.buffer_countdown {
-            Some(true) => true,
-            Some(false) => false,
-            None => matches!(backend, "local-whisper" | "local"),
-        }
+    pub fn buffer_countdown_for_backend(&self, _backend: &str) -> bool {
+        matches!(self.buffer_countdown, Some(true))
     }
 }
 
@@ -1266,18 +1263,21 @@ mod tests {
     }
 
     #[test]
-    fn input_config_buffer_countdown_auto_for_local_whisper() {
+    fn input_config_buffer_countdown_opt_in_only() {
         let input = InputConfig::default();
-        assert!(input.buffer_countdown_for_backend("local-whisper"));
+        assert!(!input.buffer_countdown_for_backend("local-whisper"));
         assert!(!input.buffer_countdown_for_backend("groq"));
-
-        let mut forced_off = input.clone();
-        forced_off.buffer_countdown = Some(false);
-        assert!(!forced_off.buffer_countdown_for_backend("local-whisper"));
 
         let mut forced_on = input;
         forced_on.buffer_countdown = Some(true);
+        assert!(forced_on.buffer_countdown_for_backend("local-whisper"));
         assert!(forced_on.buffer_countdown_for_backend("groq"));
+
+        let mut forced_off = InputConfig {
+            buffer_countdown: Some(false),
+            ..Default::default()
+        };
+        assert!(!forced_off.buffer_countdown_for_backend("local-whisper"));
     }
 
     #[test]

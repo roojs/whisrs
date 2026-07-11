@@ -1,14 +1,10 @@
-//! D-Bus window tracking stub for GNOME and KDE.
-//!
-//! GNOME requires the `window-calls` extension, and KDE requires KWin scripting.
-//! Both are limited and not yet fully implemented. This module provides a stub
-//! that returns clear error messages.
+//! D-Bus window tracking stub (reserved for future KDE integration).
 
 use tracing::warn;
 
 use super::WindowTracker;
 
-/// Stub window tracker for GNOME/KDE desktops via D-Bus.
+/// Stub window tracker for KDE desktops via D-Bus.
 pub struct DbusTracker {
     desktop: String,
 }
@@ -38,5 +34,9 @@ impl WindowTracker for DbusTracker {
         );
         // Don't fail — graceful degradation.
         Ok(())
+    }
+
+    fn supports_focus_restore(&self) -> bool {
+        false
     }
 }

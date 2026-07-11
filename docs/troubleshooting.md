@@ -22,7 +22,11 @@ Double-check your key is valid and not expired. Ensure the correct environment v
 
 ## Text goes to the wrong window
 
-whisrs captures the focused window when recording starts and restores focus before typing. This requires compositor support. See the [Supported Environments](../README.md#supported-environments) table. On GNOME Wayland, the `window-calls` extension is required.
+On **Hyprland, Sway, Niri, and X11**, whisrs remembers which window was focused when you started recording and restores focus before typing.
+
+On **GNOME and KDE Wayland**, there is no standard API for apps to refocus another window. whisrs types at whatever field has keyboard focus — **press the hotkey while your cursor is already in the target field**, and stay in that field until dictation finishes. Clicking elsewhere mid-recording will send text to the wrong place.
+
+If characters land in the wrong spot on any compositor, check that nothing else stole focus (notification popups, overlay clicks, etc.).
 
 ## TUI drops characters while whisrs types
 

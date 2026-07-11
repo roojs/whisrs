@@ -7,7 +7,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SpeechStartGate, SILENCE_RMS_THRESHOLD};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
@@ -42,6 +42,56 @@ struct CommandModeContext {
     is_terminal: bool,
 }
 
+const BUFFER_HINT_INITIAL: &str = "Buffering 3...";
+const BUFFER_HINT_UPDATES: [&str; 2] = ["Buffering 2...", "Buffering 1..."];
+const SILENCE_HINT_INITIAL: &str = "Silence.";
+const SILENCE_HINT_UPDATES: [&str; 2] = ["Silence..", "Silence..."];
+
+/// Tracks an in-field "Buffering N..." hint typed at the insert target when recording starts.
+struct BufferHint {
+    cancelled: std::sync::atomic::AtomicBool,
+    char_len: std::sync::atomic::AtomicUsize,
+    /// Set when leading silence ends and the buffering countdown begins.
+    buffering_started: std::sync::atomic::AtomicBool,
+}
+
+impl BufferHint {
+    fn new(initial_len: usize) -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            char_len: std::sync::atomic::AtomicUsize::new(initial_len),
+            buffering_started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn cancel(&self) -> usize {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.char_len
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_len(&self, len: usize) {
+        self.char_len
+            .store(len, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn start_buffering(&self) {
+        self.buffering_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_buffering(&self) -> bool {
+        self.buffering_started
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Shared daemon state protected by a mutex.
 struct DaemonState {
     state_machine: StateMachine,
@@ -54,6 +104,8 @@ struct DaemonState {
     recording_started_at: Option<std::time::Instant>,
     /// Active command mode context (set when command mode is recording).
     command_mode: Option<CommandModeContext>,
+    /// Active buffer hint shown at the insert target (cleared on first text or cancel).
+    buffer_hint: Option<Arc<BufferHint>>,
     /// Stop flag for in-progress TTS playback (read-selection-aloud).
     ///
     /// Set when a `Speak` synthesis succeeds and playback begins; cleared when
@@ -72,6 +124,7 @@ impl DaemonState {
             streaming_task: None,
             recording_started_at: None,
             command_mode: None,
+            buffer_hint: None,
             tts_stop: None,
         }
     }
@@ -846,16 +899,79 @@ async fn handle_toggle(
 
     match current_state {
         State::Idle => {
-            // Capture focused window before recording.
+            // Capture the insert target (focused window) before recording starts.
             let window_id = match context.window_tracker.get_focused_window() {
                 Ok(id) => {
-                    info!("captured source window: {id}");
+                    info!("captured insert target window: {id}");
                     Some(id)
                 }
                 Err(e) => {
-                    warn!("failed to capture focused window: {e}");
+                    warn!("failed to capture insert target window: {e}");
                     None
                 }
+            };
+
+            let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
+            let injector_backend = context.config.input.backend;
+            let show_buffer_hint = context.config.input.buffer_countdown_for_backend(
+                &context.config.general.backend,
+            ) && context.transcription_backend.supports_streaming()
+                && window_id.is_some();
+
+            // Lock keyboard focus to the insert target before capture or typing.
+            if context.window_tracker.supports_focus_restore() {
+                if let Some(wid) = &window_id {
+                    if let Err(e) = context.window_tracker.focus_window(wid) {
+                        warn!("failed to focus insert target before recording: {e}");
+                    }
+                }
+            }
+
+            // Show a leading-silence hint until speech is detected, then switch
+            // to the buffering countdown while waiting for the first transcript.
+            let buffer_hint = if show_buffer_hint {
+                let wid = window_id.as_ref().expect("checked is_some").clone();
+                let tracker = Arc::clone(&context.window_tracker);
+                let hint = Arc::new(BufferHint::new(SILENCE_HINT_INITIAL.len()));
+                let hint_for_animation = Arc::clone(&hint);
+                match tokio::task::spawn_blocking({
+                    let tracker = Arc::clone(&tracker);
+                    let wid = wid.clone();
+                    move || {
+                        insert_at_target(
+                            SILENCE_HINT_INITIAL,
+                            Some(&wid),
+                            tracker.as_ref(),
+                            0,
+                            key_delay,
+                            injector_backend,
+                        )
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(())) => {
+                        info!("showing silence hint at insert target — waiting for speech");
+                        tokio::spawn(run_silence_hint(
+                            hint_for_animation,
+                            wid,
+                            tracker,
+                            key_delay,
+                            injector_backend,
+                        ));
+                        Some(hint)
+                    }
+                    Ok(Err(e)) => {
+                        warn!("failed to show silence hint: {e:#}");
+                        None
+                    }
+                    Err(e) => {
+                        warn!("silence hint task failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             // Start recording.
@@ -863,6 +979,15 @@ async fn handle_toggle(
                 match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
                     Ok(c) => c,
                     Err(e) => {
+                        if let Some(hint) = &buffer_hint {
+                            clear_buffer_hint_at_target(
+                                hint,
+                                window_id.as_deref(),
+                                &context.window_tracker,
+                                key_delay,
+                                injector_backend,
+                            );
+                        }
                         let msg = format!("{e}");
                         let friendly = if msg.contains("no default audio input device") {
                             format_no_microphone_error()
@@ -880,9 +1005,18 @@ async fn handle_toggle(
                 let audio_rx = match capture.take_receiver() {
                     Some(rx) => rx,
                     None => {
+                        if let Some(hint) = &buffer_hint {
+                            clear_buffer_hint_at_target(
+                                hint,
+                                window_id.as_deref(),
+                                &context.window_tracker,
+                                key_delay,
+                                injector_backend,
+                            );
+                        }
                         return Response::Error {
                             message: "failed to get audio receiver".to_string(),
-                        }
+                        };
                     }
                 };
 
@@ -893,8 +1027,7 @@ async fn handle_toggle(
                 let ctx_notify = context.notify;
                 let ctx_overlay = context.overlay_enabled;
                 let window_tracker_for_pipeline = Arc::clone(&context.window_tracker);
-                // Restore focus before starting the pipeline.
-                let wid_for_focus = wid.clone();
+                let buffer_hint_for_pipeline = buffer_hint.clone();
 
                 // Spawn a task to:
                 // 1. Run auto-stop detection + forward audio to transcription
@@ -910,13 +1043,8 @@ async fn handle_toggle(
                 let pipeline_backend_name = context.config.general.backend.clone();
                 let pipeline_language = context.config.general.language.clone();
                 let pipeline_state_tx = context.state_tx.clone();
-                let pipeline_key_delay =
-                    std::time::Duration::from_millis(context.config.input.key_delay_ms);
-                let pipeline_injector_backend = context.config.input.backend;
-                let pipeline_buffer_countdown = context
-                    .config
-                    .input
-                    .buffer_countdown_for_backend(&pipeline_backend_name);
+                let pipeline_key_delay = key_delay;
+                let pipeline_injector_backend = injector_backend;
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -938,23 +1066,17 @@ async fn handle_toggle(
                         pipeline_state_tx,
                         pipeline_key_delay,
                         pipeline_injector_backend,
-                        pipeline_buffer_countdown,
+                        buffer_hint_for_pipeline,
                     )
                     .await
                 });
 
                 ds.streaming_task = Some(task);
-
-                // Focus the window now (so text goes to the right place from the start).
-                if let Some(wid) = &wid_for_focus {
-                    if let Err(e) = context.window_tracker.focus_window(wid) {
-                        warn!("failed to pre-focus window: {e}");
-                    }
-                }
             }
 
             ds.audio_capture = Some(capture);
             ds.recording_window_id = window_id;
+            ds.buffer_hint = buffer_hint;
             ds.recording_started_at = Some(std::time::Instant::now());
 
             match ds.state_machine.transition(Action::Toggle) {
@@ -973,7 +1095,17 @@ async fn handle_toggle(
                 Err(e) => {
                     ds.audio_capture = None;
                     ds.recording_window_id = None;
+                    let hint = ds.buffer_hint.take();
                     ds.streaming_task = None;
+                    if let Some(hint) = hint {
+                        clear_buffer_hint_at_target(
+                            &hint,
+                            window_id.as_deref(),
+                            &context.window_tracker,
+                            key_delay,
+                            injector_backend,
+                        );
+                    }
                     Response::Error {
                         message: e.to_string(),
                     }
@@ -1132,7 +1264,7 @@ async fn run_streaming_pipeline(
     state_tx: tokio::sync::watch::Sender<State>,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
-    buffer_countdown: bool,
+    buffer_hint: Option<Arc<BufferHint>>,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -1164,11 +1296,11 @@ async fn run_streaming_pipeline(
     // We collect deltas for a short window to avoid creating a new virtual
     // keyboard for every single word delta from the streaming API.
     let wid = window_id.clone();
+    let buffer_hint_for_typing = buffer_hint.clone();
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
-        let mut focused = false;
+        let mut hint_cleared = buffer_hint_for_typing.is_none();
         let batch_delay = std::time::Duration::from_millis(150);
-        let mut first_chunk = true;
 
         // The daemon text channel is intentionally append-only. For OpenAI
         // realtime this still feels token-by-token because the backend emits
@@ -1176,22 +1308,7 @@ async fn run_streaming_pipeline(
         // layer only forwards completed utterances, so this loop naturally
         // types phrase-sized chunks without needing any replacement semantics.
         loop {
-            // Wait for the first delta (blocking). Local whisper may show an
-            // in-field "Buffering N…" countdown while the first window runs.
-            let first = if first_chunk && buffer_countdown {
-                recv_first_text_with_buffer_countdown(
-                    &mut text_rx,
-                    &wid,
-                    &window_tracker,
-                    &mut focused,
-                    key_delay,
-                    injector_backend,
-                )
-                .await
-            } else {
-                text_rx.recv().await
-            };
-            first_chunk = false;
+            let first = text_rx.recv().await;
             let Some(first) = first else { break };
 
             // Collect this delta and any others that arrive within the batch window.
@@ -1212,18 +1329,19 @@ async fn run_streaming_pipeline(
                 }
             }
 
-            // Focus the original window (only once, or re-focus if needed).
-            if !focused {
+            // Re-focus the insert target before every batch when the compositor
+            // supports it (Hyprland, Sway, etc.). On GNOME/KDE we type at the
+            // current cursor — stay in your field while recording.
+            if window_tracker.supports_focus_restore() {
                 if let Some(wid) = &wid {
                     let wid_clone = wid.clone();
                     let tracker = Arc::clone(&window_tracker);
                     if let Err(e) = tracker.focus_window(&wid_clone) {
-                        warn!("failed to refocus window {wid_clone} before typing: {e}");
+                        warn!("failed to refocus insert target {wid_clone} before typing: {e}");
                     } else {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
-                focused = true;
             }
 
             // Add space separator between turns if needed.
@@ -1242,8 +1360,26 @@ async fn run_streaming_pipeline(
             full_text.push_str(&text_to_type);
 
             info!("typing: {:?}", text_to_type);
+            let clear_hint_len = if !hint_cleared {
+                hint_cleared = true;
+                buffer_hint_for_typing
+                    .as_ref()
+                    .map(|hint| hint.cancel())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let wid_for_insert = wid.clone();
+            let tracker_for_insert = Arc::clone(&window_tracker);
             match tokio::task::spawn_blocking(move || {
-                type_text_at_cursor(&text_to_type, key_delay, injector_backend)
+                insert_at_target(
+                    &text_to_type,
+                    wid_for_insert.as_deref(),
+                    tracker_for_insert.as_ref(),
+                    clear_hint_len,
+                    key_delay,
+                    injector_backend,
+                )
             })
             .await
             {
@@ -1259,8 +1395,56 @@ async fn run_streaming_pipeline(
     // Forward audio from capture to backend, with auto-stop detection.
     let mut auto_stop =
         AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
+    let mut speech_gate = SpeechStartGate::new(SILENCE_RMS_THRESHOLD);
+    let mut buffering_countdown_started = false;
 
     while let Some(chunk) = audio_rx.recv().await {
+        let had_speech = speech_gate.has_speech();
+        speech_gate.feed(&chunk);
+
+        if let (Some(hint), Some(wid)) = (&buffer_hint, &window_id) {
+            if !buffering_countdown_started && speech_gate.has_speech() && !had_speech {
+                buffering_countdown_started = true;
+                hint.start_buffering();
+                let hint_clone = Arc::clone(hint);
+                let wid = wid.clone();
+                let tracker = Arc::clone(&window_tracker);
+                info!("speech detected — switching hint to buffering countdown");
+                let prev_len = hint_clone
+                    .char_len
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                match tokio::task::spawn_blocking({
+                    let tracker = Arc::clone(&tracker);
+                    let wid = wid.clone();
+                    move || {
+                        insert_at_target(
+                            BUFFER_HINT_INITIAL,
+                            Some(&wid),
+                            tracker.as_ref(),
+                            prev_len,
+                            key_delay,
+                            injector_backend,
+                        )
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(())) => {
+                        hint_clone.set_len(BUFFER_HINT_INITIAL.len());
+                        tokio::spawn(run_buffer_countdown(
+                            hint_clone,
+                            wid,
+                            tracker,
+                            key_delay,
+                            injector_backend,
+                        ));
+                    }
+                    Ok(Err(e)) => warn!("failed to switch to buffer hint: {e:#}"),
+                    Err(e) => warn!("buffer hint switch task failed: {e}"),
+                }
+            }
+        }
+
         // Check for auto-stop.
         if auto_stop.feed(&chunk) {
             info!("silence auto-stop triggered after {silence_timeout_ms}ms");
@@ -1389,7 +1573,198 @@ async fn run_streaming_pipeline(
         }
     }
 
+    // Remove any leftover hint when no transcription text arrived.
+    if let Some(hint) = &buffer_hint {
+        if !hint.is_cancelled() {
+            let clear_len = hint.cancel();
+            if clear_len > 0 {
+                let wid = window_id.clone();
+                let tracker = Arc::clone(&window_tracker);
+                let _ = tokio::task::spawn_blocking(move || {
+                    insert_at_target(
+                        "",
+                        wid.as_deref(),
+                        tracker.as_ref(),
+                        clear_len,
+                        key_delay,
+                        injector_backend,
+                    )
+                })
+                .await;
+            }
+        }
+    }
+
     Ok(full_text)
+}
+
+async fn run_silence_hint(
+    hint: Arc<BufferHint>,
+    window_id: String,
+    tracker: Arc<dyn WindowTracker>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) {
+    for update in SILENCE_HINT_UPDATES {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if hint.is_cancelled() || hint.is_buffering() {
+            return;
+        }
+        let prev_len = hint
+            .char_len
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let tracker_clone = Arc::clone(&tracker);
+        let window_id = window_id.clone();
+        let update = update.to_string();
+        match tokio::task::spawn_blocking(move || {
+            insert_at_target(
+                &update,
+                Some(&window_id),
+                tracker_clone.as_ref(),
+                prev_len,
+                key_delay,
+                injector_backend,
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => hint.set_len(update.len()),
+            Ok(Err(e)) => {
+                warn!("failed to update silence hint: {e:#}");
+                return;
+            }
+            Err(e) => {
+                warn!("silence hint update task failed: {e}");
+                return;
+            }
+        }
+    }
+
+    // Hold on "Silence..." until speech is detected or the hint is cleared.
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if hint.is_cancelled() || hint.is_buffering() {
+            return;
+        }
+    }
+}
+
+async fn run_buffer_countdown(
+    hint: Arc<BufferHint>,
+    window_id: String,
+    tracker: Arc<dyn WindowTracker>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) {
+    for update in BUFFER_HINT_UPDATES {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if hint.is_cancelled() {
+            return;
+        }
+        let prev_len = hint
+            .char_len
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let tracker_clone = Arc::clone(&tracker);
+        let window_id = window_id.clone();
+        let update = update.to_string();
+        match tokio::task::spawn_blocking(move || {
+            insert_at_target(
+                &update,
+                Some(&window_id),
+                tracker_clone.as_ref(),
+                prev_len,
+                key_delay,
+                injector_backend,
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => hint.set_len(update.len()),
+            Ok(Err(e)) => {
+                warn!("failed to update buffer hint: {e:#}");
+                return;
+            }
+            Err(e) => {
+                warn!("buffer hint update task failed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+fn clear_buffer_hint_at_target(
+    hint: &BufferHint,
+    window_id: Option<&str>,
+    tracker: &Arc<dyn WindowTracker>,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+) {
+    let len = hint.cancel();
+    if len == 0 {
+        return;
+    }
+    if let Err(e) = insert_at_target("", window_id, tracker.as_ref(), len, key_delay, backend) {
+        warn!("failed to clear buffer hint: {e:#}");
+    }
+}
+
+/// Focus the insert target, optionally clear a hint, then type text.
+fn insert_at_target(
+    text: &str,
+    window_id: Option<&str>,
+    tracker: &dyn WindowTracker,
+    clear_hint_len: usize,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+) -> Result<()> {
+    if let Some(wid) = window_id {
+        if tracker.supports_focus_restore() {
+            tracker
+                .focus_window(wid)
+                .context("failed to focus insert target")?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    if clear_hint_len > 0 {
+        backspace_at_cursor(clear_hint_len, key_delay, backend)?;
+    }
+    if !text.is_empty() {
+        type_text_at_cursor(text, key_delay, backend)?;
+    }
+    Ok(())
+}
+
+fn backspace_at_cursor(
+    count: usize,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+    let mut keyboard_guard = keyboard_slot
+        .lock()
+        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+
+    if keyboard_guard.is_none() {
+        *keyboard_guard = Some(new_keyboard(key_delay, false, backend)?);
+    }
+
+    let keyboard = keyboard_guard
+        .as_mut()
+        .expect("keyboard exists after initialization");
+    keyboard.set_key_delay(key_delay);
+
+    let result = keyboard
+        .backspace(count)
+        .context("failed to backspace over buffer hint");
+    if result.is_err() {
+        *keyboard_guard = None;
+    }
+    result?;
+    Ok(())
 }
 
 /// Batch mode: collect all audio, transcribe in one shot, type result.
@@ -1587,179 +1962,6 @@ fn format_api_error(err: &anyhow::Error) -> String {
         return "Cannot reach API — check your internet connection".to_string();
     }
     msg
-}
-
-fn backspace_at_cursor(
-    count: usize,
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
-) -> Result<()> {
-    if count == 0 {
-        return Ok(());
-    }
-
-    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
-    let mut keyboard_guard = keyboard_slot
-        .lock()
-        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
-
-    if keyboard_guard.is_none() {
-        *keyboard_guard = Some(new_keyboard(
-            key_delay, /* prewarm = */ false, backend,
-        )?);
-    }
-
-    let keyboard = keyboard_guard
-        .as_mut()
-        .expect("keyboard exists after initialization");
-    keyboard.set_key_delay(key_delay);
-
-    let result = keyboard
-        .backspace(count)
-        .context("failed to backspace typed text");
-    if result.is_err() {
-        *keyboard_guard = None;
-    }
-    result?;
-    Ok(())
-}
-
-async fn focus_window_for_typing(
-    window_id: &Option<String>,
-    window_tracker: &Arc<dyn WindowTracker>,
-    focused: &mut bool,
-) {
-    if *focused {
-        return;
-    }
-    if let Some(wid) = window_id {
-        let wid_clone = wid.clone();
-        let tracker = Arc::clone(window_tracker);
-        if let Err(e) = tracker.focus_window(&wid_clone) {
-            warn!("failed to refocus window {wid_clone} before typing: {e}");
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-    *focused = true;
-}
-
-async fn clear_buffer_countdown_hint(
-    typed_len: &mut usize,
-    key_delay: std::time::Duration,
-    injector_backend: InjectorBackend,
-) {
-    if *typed_len == 0 {
-        return;
-    }
-    let count = *typed_len;
-    *typed_len = 0;
-    match tokio::task::spawn_blocking(move || {
-        backspace_at_cursor(count, key_delay, injector_backend)
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("failed to clear buffering hint: {e:#}"),
-        Err(e) => warn!("failed to join backspace task for buffering hint: {e}"),
-    }
-}
-
-async fn inject_buffer_countdown_hint(
-    typed_len: &mut usize,
-    key_delay: std::time::Duration,
-    injector_backend: InjectorBackend,
-) -> bool {
-    let hint = "Buffering 3...";
-    *typed_len = hint.chars().count();
-    let hint_for_type = hint.to_string();
-    match tokio::task::spawn_blocking(move || {
-        type_text_at_cursor(&hint_for_type, key_delay, injector_backend)
-    })
-    .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            warn!("failed to type buffering hint: {e:#}");
-            *typed_len = 0;
-            false
-        }
-        Err(e) => {
-            warn!("failed to join typing task for buffering hint: {e}");
-            *typed_len = 0;
-            false
-        }
-    }
-}
-
-async fn update_buffer_countdown_digit(
-    n: u32,
-    key_delay: std::time::Duration,
-    injector_backend: InjectorBackend,
-) -> bool {
-    let digit = n.to_string();
-    match tokio::task::spawn_blocking(move || {
-        backspace_at_cursor(1, key_delay, injector_backend)?;
-        type_text_at_cursor(&digit, key_delay, injector_backend)
-    })
-    .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            warn!("failed to update buffering hint digit: {e:#}");
-            false
-        }
-        Err(e) => {
-            warn!("failed to join typing task for buffering hint digit: {e}");
-            false
-        }
-    }
-}
-
-/// Wait for the first transcription chunk, optionally typing a 3-2-1 countdown
-/// at the cursor so the user sees progress in the target input field.
-async fn recv_first_text_with_buffer_countdown(
-    text_rx: &mut tokio::sync::mpsc::Receiver<String>,
-    window_id: &Option<String>,
-    window_tracker: &Arc<dyn WindowTracker>,
-    focused: &mut bool,
-    key_delay: std::time::Duration,
-    injector_backend: InjectorBackend,
-) -> Option<String> {
-    let mut typed_len = 0usize;
-    let mut hints_enabled = true;
-
-    focus_window_for_typing(window_id, window_tracker, focused).await;
-    if hints_enabled {
-        hints_enabled =
-            inject_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
-    }
-
-    for n in [2_u32, 1] {
-        tokio::select! {
-            text = text_rx.recv() => {
-                clear_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
-                return text;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-        }
-
-        if hints_enabled {
-            hints_enabled = update_buffer_countdown_digit(n, key_delay, injector_backend).await;
-        }
-
-        tokio::select! {
-            text = text_rx.recv() => {
-                clear_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
-                return text;
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-        }
-    }
-
-    let text = text_rx.recv().await;
-    clear_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
-    text
 }
 
 /// Type text at the cursor using uinput (keyboard injection) or clipboard paste.
@@ -2784,11 +2986,23 @@ async fn handle_cancel(
             if let Some(task) = ds.streaming_task.take() {
                 task.abort();
             }
-            ds.recording_window_id = None;
+            let buffer_hint = ds.buffer_hint.take();
+            let window_id = ds.recording_window_id.take();
             if let Some(level_tx) = &context.overlay_level_tx {
                 let _ = level_tx.send(0.0);
             }
             info!("cancelled recording");
+            if let Some(hint) = buffer_hint {
+                let key_delay =
+                    std::time::Duration::from_millis(context.config.input.key_delay_ms);
+                clear_buffer_hint_at_target(
+                    &hint,
+                    window_id.as_deref(),
+                    &context.window_tracker,
+                    key_delay,
+                    context.config.input.backend,
+                );
+            }
             if context.notify_state() {
                 send_notification("whisrs", "Recording cancelled");
             }

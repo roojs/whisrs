@@ -23,6 +23,13 @@ pub trait WindowTracker: Send + Sync {
     fn get_focused_window_class(&self) -> Option<String> {
         None
     }
+
+    /// Whether this backend can re-activate a captured window before typing.
+    /// When `false`, whisrs types at the current keyboard focus (the field
+    /// that was active when you toggled recording).
+    fn supports_focus_restore(&self) -> bool {
+        true
+    }
 }
 
 /// A no-op tracker that always succeeds without doing anything.
@@ -37,6 +44,10 @@ impl WindowTracker for NoopTracker {
 
     fn focus_window(&self, _id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn supports_focus_restore(&self) -> bool {
+        false
     }
 }
 
@@ -77,12 +88,17 @@ pub fn detect_tracker() -> Box<dyn WindowTracker> {
         }
     }
 
-    // Check for GNOME/KDE on Wayland (stub/placeholder).
+    // GNOME / KDE on Wayland: no portable window-focus API without compositor-
+    // specific hooks. whisrs types at whatever has keyboard focus when you
+    // toggle — keep the cursor in your target field while dictating.
     if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
         let desktop_lower = desktop.to_lowercase();
         if desktop_lower.contains("gnome") || desktop_lower.contains("kde") {
-            info!("detected {desktop} desktop — window tracking is limited; using D-Bus stub");
-            return Box::new(dbus::DbusTracker::new(&desktop));
+            info!(
+                "detected {desktop} on Wayland — typing at current keyboard focus \
+                 (no window refocus; stay in your target field while recording)"
+            );
+            return Box::new(NoopTracker);
         }
     }
 

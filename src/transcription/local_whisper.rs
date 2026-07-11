@@ -28,9 +28,12 @@ const STEP_SAMPLES: usize = STEP_SECS * SAMPLE_RATE;
 const INITIAL_WINDOW_SECS: usize = 2;
 const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
 
-/// Silence threshold — must match or be below the daemon's auto-stop threshold
-/// (0.003) so we never skip windows that auto-stop considers speech.
-const SILENCE_THRESHOLD: f64 = 0.003;
+/// Silence threshold for skipping inference windows — slightly stricter than the
+/// daemon auto-stop threshold so we do not send borderline noise to whisper.
+const INFERENCE_SILENCE_THRESHOLD: f64 = 0.006;
+
+/// Segments with higher no_speech probability are discarded as non-speech.
+const NO_SPEECH_SEGMENT_THRESHOLD: f32 = 0.50;
 
 struct StreamInferJob {
     samples: Vec<f32>,
@@ -141,6 +144,24 @@ fn run_whisper_inference_on_state(
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_n_threads(inference_thread_count());
+    params.set_suppress_blank(true);
+    // Block parenthetical sound descriptions like "(dog barking)" on silence.
+    params.set_suppress_nst(true);
+
+    if streaming {
+        params.set_single_segment(true);
+        // Each sliding window is a fresh decode; continuity comes from
+        // `initial_prompt` (the committed transcript), not decoder state.
+        params.set_no_context(true);
+    } else {
+        params.set_no_context(false);
+    }
+
     if language != "auto" {
         params.set_language(Some(language));
     }
@@ -150,29 +171,87 @@ fn run_whisper_inference_on_state(
             params.set_initial_prompt(prompt);
         }
     }
-    // Keep whisper context across windows; initial_prompt maintains consistency.
-    params.set_no_context(false);
-
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_n_threads(inference_thread_count());
-
-    if streaming {
-        params.set_single_segment(true);
-    }
 
     state
         .full(params, audio)
         .map_err(|e| anyhow::anyhow!("whisper inference failed: {e}"))?;
 
+    Ok(collect_whisper_text(state))
+}
+
+/// True for whisper's common bracketed sound-effect hallucinations on silence.
+fn is_parenthetical_sound_hallucination(text: &str) -> bool {
+    let t = text.trim();
+    let Some(inner) = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    let inner = inner.trim().to_lowercase();
+    if inner.is_empty() {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "bark",
+        "barking",
+        "dog",
+        "applause",
+        "music",
+        "silence",
+        "pause",
+        "laugh",
+        "laughter",
+        "sigh",
+        "breath",
+        "cough",
+        "noise",
+        "static",
+        "inaudible",
+        "unintelligible",
+        "beep",
+        "click",
+        "crowd",
+        "cheering",
+        "whistle",
+        "horn",
+        "meow",
+        "moo",
+        "murmur",
+        "mumbling",
+        "footstep",
+    ];
+    MARKERS.iter().any(|marker| inner.contains(marker))
+}
+
+fn filter_whisper_segment(text: &str, no_speech_prob: f32) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if no_speech_prob > NO_SPEECH_SEGMENT_THRESHOLD {
+        return None;
+    }
+    if is_parenthetical_sound_hallucination(t) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+fn collect_whisper_text(state: &whisper_rs::WhisperState) -> String {
     let mut text = String::new();
     for segment in state.as_iter() {
-        text.push_str(&format!("{}", segment));
+        let raw = segment.to_str_lossy().unwrap_or_default();
+        match filter_whisper_segment(&raw, segment.no_speech_probability()) {
+            Some(part) => text.push_str(&part),
+            None if !raw.trim().is_empty() => {
+                debug!(
+                    "filtered whisper segment (no_speech={:.2}): {:?}",
+                    segment.no_speech_probability(),
+                    raw
+                );
+            }
+            None => {}
+        }
     }
-
-    Ok(text.trim().to_string())
+    text.trim().to_string()
 }
 
 /// Run whisper inference on an audio window.
@@ -217,31 +296,33 @@ async fn process_stream_window(
     infer_tx: &std::sync::mpsc::SyncSender<StreamInferJob>,
     window: &[i16],
     language: &str,
-    prompt: &mut String,
+    committed: &mut String,
     dedup: &mut TextDedup,
     text_tx: &mpsc::Sender<String>,
 ) {
-    if audio_silence_gate::is_silent(window, SILENCE_THRESHOLD) {
+    if audio_silence_gate::is_silent(window, INFERENCE_SILENCE_THRESHOLD) {
         return;
     }
 
     let samples_f32 = i16_to_f32(window);
-    let prev_prompt = if prompt.is_empty() {
+    let prev_prompt = if committed.is_empty() {
         None
     } else {
-        Some(prompt.as_str())
+        Some(committed.as_str())
     };
 
     match infer_stream_window(infer_tx, samples_f32, language, prev_prompt).await {
         Ok(full_text) => {
-            if !full_text.is_empty() {
-                prompt.clone_from(&full_text);
-            }
             let new_text = dedup.filter_text(&full_text);
-            if !new_text.trim().is_empty() {
-                debug!("streaming window produced: {:?}", new_text);
-                text_tx.send(new_text).await.ok();
+            if new_text.trim().is_empty() {
+                return;
             }
+            if !committed.is_empty() && !committed.ends_with(' ') {
+                committed.push(' ');
+            }
+            committed.push_str(new_text.trim());
+            debug!("streaming window produced: {:?}", new_text);
+            text_tx.send(new_text).await.ok();
         }
         Err(e) => warn!("whisper window inference failed: {e}"),
     }
@@ -296,14 +377,26 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let mut dedup = TextDedup::new();
         let mut next_process_at = INITIAL_WINDOW_SAMPLES;
         let mut last_processed_end: usize = 0;
-        // Previous full transcription fed as prompt to the next window.
-        // Seed with vocabulary prompt if available.
-        let mut prompt = config.prompt.clone().unwrap_or_default();
+        // Committed transcript fed back as initial_prompt for the next window.
+        let mut committed = config.prompt.clone().unwrap_or_default();
+        let mut speech_gate =
+            audio_silence_gate::SpeechStartGate::new(audio_silence_gate::SILENCE_RMS_THRESHOLD);
 
         while let Some(chunk) = audio_rx.recv().await {
+            speech_gate.feed(&chunk);
             buffer.extend_from_slice(&chunk);
 
             while buffer.len() >= next_process_at {
+                if !speech_gate.has_speech() {
+                    debug!(
+                        "leading silence — skipping inference until speech (at sample {})",
+                        next_process_at
+                    );
+                    last_processed_end = next_process_at;
+                    next_process_at += STEP_SAMPLES;
+                    continue;
+                }
+
                 let window_size = if last_processed_end == 0 {
                     INITIAL_WINDOW_SAMPLES.min(buffer.len())
                 } else {
@@ -314,7 +407,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 let window_start = window_end.saturating_sub(window_size);
                 let window = buffer[window_start..window_end].to_vec();
 
-                if audio_silence_gate::is_silent(&window, SILENCE_THRESHOLD) {
+                if audio_silence_gate::is_silent(&window, INFERENCE_SILENCE_THRESHOLD) {
                     debug!(
                         "skipping silent window at samples {}..{}",
                         window_start, window_end
@@ -324,7 +417,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
                         &infer_tx,
                         &window,
                         &config.language,
-                        &mut prompt,
+                        &mut committed,
                         &mut dedup,
                         &text_tx,
                     )
@@ -349,7 +442,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 &infer_tx,
                 &remaining,
                 &config.language,
-                &mut prompt,
+                &mut committed,
                 &mut dedup,
                 &text_tx,
             )
@@ -393,5 +486,17 @@ mod tests {
         assert_eq!(f32_samples[0], 0.0);
         assert!((f32_samples[1] - 1.0).abs() < 0.001);
         assert!((f32_samples[2] + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn filters_dog_bark_hallucinations() {
+        assert!(is_parenthetical_sound_hallucination("(dog barks)"));
+        assert!(is_parenthetical_sound_hallucination("(dog barking)"));
+        assert!(!is_parenthetical_sound_hallucination("Can you download"));
+        assert!(filter_whisper_segment("(dog barks)", 0.1).is_none());
+        assert_eq!(
+            filter_whisper_segment("Can you download", 0.1).as_deref(),
+            Some("Can you download")
+        );
     }
 }
