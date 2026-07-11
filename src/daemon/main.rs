@@ -1645,14 +1645,15 @@ async fn focus_window_for_typing(
 }
 
 async fn clear_buffer_countdown_hint(
-    current_hint: &mut Option<String>,
+    typed_len: &mut usize,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
 ) {
-    let Some(hint) = current_hint.take() else {
+    if *typed_len == 0 {
         return;
-    };
-    let count = hint.chars().count();
+    }
+    let count = *typed_len;
+    *typed_len = 0;
     match tokio::task::spawn_blocking(move || {
         backspace_at_cursor(count, key_delay, injector_backend)
     })
@@ -1664,30 +1665,52 @@ async fn clear_buffer_countdown_hint(
     }
 }
 
-async fn show_buffer_countdown_hint(
-    n: u32,
-    current_hint: &mut Option<String>,
+async fn inject_buffer_countdown_hint(
+    typed_len: &mut usize,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
 ) -> bool {
-    clear_buffer_countdown_hint(current_hint, key_delay, injector_backend).await;
-    let hint = format!("Buffering {n}...");
-    let hint_for_type = hint.clone();
+    let hint = "Buffering 3...";
+    *typed_len = hint.chars().count();
+    let hint_for_type = hint.to_string();
     match tokio::task::spawn_blocking(move || {
         type_text_at_cursor(&hint_for_type, key_delay, injector_backend)
     })
     .await
     {
-        Ok(Ok(())) => {
-            *current_hint = Some(hint);
-            true
-        }
+        Ok(Ok(())) => true,
         Ok(Err(e)) => {
             warn!("failed to type buffering hint: {e:#}");
+            *typed_len = 0;
             false
         }
         Err(e) => {
             warn!("failed to join typing task for buffering hint: {e}");
+            *typed_len = 0;
+            false
+        }
+    }
+}
+
+async fn update_buffer_countdown_digit(
+    n: u32,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) -> bool {
+    let digit = n.to_string();
+    match tokio::task::spawn_blocking(move || {
+        backspace_at_cursor(1, key_delay, injector_backend)?;
+        type_text_at_cursor(&digit, key_delay, injector_backend)
+    })
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!("failed to update buffering hint digit: {e:#}");
+            false
+        }
+        Err(e) => {
+            warn!("failed to join typing task for buffering hint digit: {e}");
             false
         }
     }
@@ -1703,19 +1726,31 @@ async fn recv_first_text_with_buffer_countdown(
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
 ) -> Option<String> {
-    let mut current_hint: Option<String> = None;
+    let mut typed_len = 0usize;
     let mut hints_enabled = true;
 
-    for n in [3_u32, 2, 1] {
-        focus_window_for_typing(window_id, window_tracker, focused).await;
+    focus_window_for_typing(window_id, window_tracker, focused).await;
+    if hints_enabled {
+        hints_enabled =
+            inject_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
+    }
+
+    for n in [2_u32, 1] {
+        tokio::select! {
+            text = text_rx.recv() => {
+                clear_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
+                return text;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+
         if hints_enabled {
-            hints_enabled =
-                show_buffer_countdown_hint(n, &mut current_hint, key_delay, injector_backend).await;
+            hints_enabled = update_buffer_countdown_digit(n, key_delay, injector_backend).await;
         }
 
         tokio::select! {
             text = text_rx.recv() => {
-                clear_buffer_countdown_hint(&mut current_hint, key_delay, injector_backend).await;
+                clear_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
                 return text;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -1723,7 +1758,7 @@ async fn recv_first_text_with_buffer_countdown(
     }
 
     let text = text_rx.recv().await;
-    clear_buffer_countdown_hint(&mut current_hint, key_delay, injector_backend).await;
+    clear_buffer_countdown_hint(&mut typed_len, key_delay, injector_backend).await;
     text
 }
 

@@ -39,53 +39,46 @@ struct StreamInferJob {
     result_tx: oneshot::Sender<anyhow::Result<String>>,
 }
 
-/// Long-lived inference worker started when the model loads. Avoids spawning a
-/// thread and allocating GPU buffers on every recording toggle.
-struct StreamInferWorker {
-    job_tx: std::sync::mpsc::SyncSender<StreamInferJob>,
-}
+/// Inference worker for one recording session. Whisper state must not be
+/// reused across sessions or the previous transcript can bleed into the next.
+fn start_stream_infer_thread(
+    ctx: Arc<whisper_rs::WhisperContext>,
+) -> anyhow::Result<std::sync::mpsc::SyncSender<StreamInferJob>> {
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<StreamInferJob>(1);
 
-impl StreamInferWorker {
-    fn start(ctx: Arc<whisper_rs::WhisperContext>) -> anyhow::Result<Self> {
-        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<StreamInferJob>(1);
-
-        std::thread::Builder::new()
-            .name("whisper-stream".into())
-            .spawn(move || {
-                let mut state = match ctx.create_state() {
-                    Ok(state) => state,
-                    Err(e) => {
-                        let err = format!("failed to create whisper streaming state: {e}");
-                        while let Ok(job) = job_rx.recv() {
-                            let _ = job.result_tx.send(Err(anyhow::anyhow!("{err}")));
-                        }
-                        return;
+    std::thread::Builder::new()
+        .name("whisper-stream".into())
+        .spawn(move || {
+            let mut state = match ctx.create_state() {
+                Ok(state) => state,
+                Err(e) => {
+                    let err = format!("failed to create whisper streaming state: {e}");
+                    while let Ok(job) = job_rx.recv() {
+                        let _ = job.result_tx.send(Err(anyhow::anyhow!("{err}")));
                     }
-                };
-
-                info!("whisper streaming inference worker ready");
-
-                while let Ok(job) = job_rx.recv() {
-                    let result = run_whisper_inference_on_state(
-                        &mut state,
-                        &job.samples,
-                        &job.language,
-                        job.prompt.as_deref(),
-                        true,
-                    );
-                    let _ = job.result_tx.send(result);
+                    return;
                 }
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn whisper streaming inference thread: {e}"))?;
+            };
 
-        Ok(Self { job_tx })
-    }
+            while let Ok(job) = job_rx.recv() {
+                let result = run_whisper_inference_on_state(
+                    &mut state,
+                    &job.samples,
+                    &job.language,
+                    job.prompt.as_deref(),
+                    true,
+                );
+                let _ = job.result_tx.send(result);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn whisper streaming inference thread: {e}"))?;
+
+    Ok(job_tx)
 }
 
 /// Local whisper.cpp transcription backend.
 pub struct LocalWhisperBackend {
     ctx: Option<Arc<whisper_rs::WhisperContext>>,
-    stream_infer: Option<StreamInferWorker>,
     #[allow(dead_code)]
     model_path: String,
 }
@@ -104,19 +97,7 @@ impl LocalWhisperBackend {
             }
         };
 
-        let stream_infer = ctx.as_ref().and_then(|ctx| match StreamInferWorker::start(Arc::clone(ctx)) {
-            Ok(worker) => Some(worker),
-            Err(e) => {
-                warn!("failed to start whisper streaming worker: {e}");
-                None
-            }
-        });
-
-        Self {
-            ctx,
-            stream_infer,
-            model_path,
-        }
+        Self { ctx, model_path }
     }
 
     fn load_model(path: &str) -> anyhow::Result<whisper_rs::WhisperContext> {
@@ -304,12 +285,12 @@ impl TranscriptionBackend for LocalWhisperBackend {
         text_tx: mpsc::Sender<String>,
         config: &TranscriptionConfig,
     ) -> anyhow::Result<()> {
-        let infer_tx = self
-            .stream_infer
+        let ctx = self
+            .ctx
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("whisper model not loaded from {}", self.model_path))?
-            .job_tx
-            .clone();
+            .ok_or_else(|| anyhow::anyhow!("whisper model not loaded from {}", self.model_path))?;
+
+        let infer_tx = start_stream_infer_thread(Arc::clone(ctx))?;
 
         let mut buffer: Vec<i16> = Vec::new();
         let mut dedup = TextDedup::new();
