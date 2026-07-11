@@ -224,6 +224,79 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
+/// Deduplicate a sliding-window transcription against text already committed
+/// to the output stream.
+///
+/// Applies [`remove_overlap`] against the full committed transcript (handles
+/// prompt-echo after silence gaps), then strips any leading phrase that still
+/// repeats a contiguous run already present in `committed` (handles whisper
+/// partially re-stating recent words before new content).
+pub fn dedup_window_text(committed: &str, window_text: &str) -> String {
+    if window_text.trim().is_empty() {
+        return String::new();
+    }
+    let after_overlap = if committed.is_empty() {
+        window_text.trim().to_string()
+    } else {
+        remove_overlap(committed, window_text)
+    };
+    if after_overlap.is_empty() {
+        return String::new();
+    }
+    strip_repeated_committed_prefix(committed, &after_overlap)
+}
+
+/// Remove a leading phrase from `text` when it repeats a contiguous run already
+/// present anywhere in `committed`.
+fn strip_repeated_committed_prefix(committed: &str, text: &str) -> String {
+    let committed_words: Vec<&str> = committed.split_whitespace().collect();
+    let text_words: Vec<&str> = text.split_whitespace().collect();
+    if committed_words.is_empty() || text_words.len() < 2 {
+        return text.to_string();
+    }
+
+    let max_prefix = text_words.len().min(12);
+    for prefix_len in (2..=max_prefix).rev() {
+        let prefix = &text_words[..prefix_len];
+        if committed_contains_phrase(&committed_words, prefix) {
+            let remaining = &text_words[prefix_len..];
+            return if remaining.is_empty() {
+                String::new()
+            } else {
+                remaining.join(" ")
+            };
+        }
+    }
+
+    text.to_string()
+}
+
+fn committed_contains_phrase(committed_words: &[&str], phrase: &[&str]) -> bool {
+    if phrase.is_empty() || phrase.len() > committed_words.len() {
+        return false;
+    }
+    for start in 0..=committed_words.len() - phrase.len() {
+        if ngram_match(&committed_words[start..start + phrase.len()], phrase) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the last `max_words` words of `text` for use as a whisper
+/// `initial_prompt` tail (avoids echoing an entire long transcript).
+pub fn prompt_tail(text: &str, max_words: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    if words.len() <= max_words {
+        text.trim().to_string()
+    } else {
+        words[words.len() - max_words..].join(" ")
+    }
+}
+
 /// Remove overlapping text between the end of `previous` and `new`.
 ///
 /// Uses an anchor-search strategy: takes the last N words of `previous` and
@@ -599,6 +672,38 @@ mod tests {
         // Short prev — falls back to prefix alignment.
         let result = remove_overlap("brown fox", "brown fox jumps");
         assert_eq!(result, "jumps");
+    }
+
+    #[test]
+    fn dedup_window_text_strips_gap_echo() {
+        let committed = "I'm seeing you too";
+        let window = "I'm seeing you too I'm seeing you duplicate a bit";
+        assert_eq!(
+            dedup_window_text(committed, window),
+            "duplicate a bit"
+        );
+    }
+
+    #[test]
+    fn dedup_window_text_sliding_window() {
+        let mut committed = String::new();
+        for (window, expected) in [
+            ("the quick brown fox", "the quick brown fox"),
+            ("the quick brown fox jumps over", "jumps over"),
+        ] {
+            let novel = dedup_window_text(&committed, window);
+            assert_eq!(novel, expected);
+            if !committed.is_empty() && !committed.ends_with(' ') {
+                committed.push(' ');
+            }
+            committed.push_str(&novel);
+        }
+    }
+
+    #[test]
+    fn prompt_tail_limits_words() {
+        assert_eq!(prompt_tail("one two three four five", 3), "three four five");
+        assert_eq!(prompt_tail("short", 10), "short");
     }
 
     #[test]

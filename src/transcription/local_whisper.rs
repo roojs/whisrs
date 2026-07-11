@@ -2,15 +2,16 @@
 //!
 //! Uses whisper-rs with a sliding window approach for pseudo-streaming.
 //!
-//! Deduplication strategy: each window is transcribed with `set_initial_prompt()`
-//! set to the previous output for consistency. Text-based n-gram overlap removal
-//! (from `dedup.rs`) strips the repeated prefix. Timestamp filtering is not used
-//! because whisper often produces a single segment with `start_timestamp=0`,
-//! making timestamp-based approaches unreliable.
+//! Deduplication strategy: each window is transcribed with a short
+//! `initial_prompt` tail for consistency. [`asr_dedup::dedup_window_text`]
+//! strips overlap against the committed transcript (including prompt echo after
+//! silence gaps). Timestamp filtering is not used because whisper often
+//! produces a single segment with `start_timestamp=0`, making timestamp-based
+//! approaches unreliable.
 
 use std::sync::Arc;
 
-use asr_dedup::TextDedup;
+use asr_dedup::{dedup_window_text, prompt_tail};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -34,6 +35,14 @@ const INFERENCE_SILENCE_THRESHOLD: f64 = 0.006;
 
 /// Segments with higher no_speech probability are discarded as non-speech.
 const NO_SPEECH_SEGMENT_THRESHOLD: f32 = 0.50;
+
+/// Maximum words passed as whisper `initial_prompt` (full committed text causes
+/// echo after silence gaps).
+const PROMPT_TAIL_WORDS: usize = 20;
+
+/// Skip `initial_prompt` after this many consecutive silent inference windows
+/// (~1 s each) so whisper does not regurgitate stale context after a pause.
+const SILENT_SKIPS_BEFORE_OMIT_PROMPT: u32 = 2;
 
 struct StreamInferJob {
     samples: Vec<f32>,
@@ -297,23 +306,35 @@ async fn process_stream_window(
     window: &[i16],
     language: &str,
     committed: &mut String,
-    dedup: &mut TextDedup,
     text_tx: &mpsc::Sender<String>,
+    omit_initial_prompt: bool,
 ) {
     if audio_silence_gate::is_silent(window, INFERENCE_SILENCE_THRESHOLD) {
         return;
     }
 
     let samples_f32 = i16_to_f32(window);
-    let prev_prompt = if committed.is_empty() {
+    let prev_prompt = if omit_initial_prompt || committed.is_empty() {
         None
     } else {
-        Some(committed.as_str())
+        let tail = prompt_tail(committed, PROMPT_TAIL_WORDS);
+        if tail.is_empty() {
+            None
+        } else {
+            Some(tail)
+        }
     };
 
-    match infer_stream_window(infer_tx, samples_f32, language, prev_prompt).await {
+    match infer_stream_window(
+        infer_tx,
+        samples_f32,
+        language,
+        prev_prompt.as_deref(),
+    )
+    .await
+    {
         Ok(full_text) => {
-            let new_text = dedup.filter_text(&full_text);
+            let new_text = dedup_window_text(committed, &full_text);
             if new_text.trim().is_empty() {
                 return;
             }
@@ -374,10 +395,10 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let infer_tx = start_stream_infer_thread(Arc::clone(ctx))?;
 
         let mut buffer: Vec<i16> = Vec::new();
-        let mut dedup = TextDedup::new();
         let mut next_process_at = INITIAL_WINDOW_SAMPLES;
         let mut last_processed_end: usize = 0;
-        // Committed transcript fed back as initial_prompt for the next window.
+        let mut consecutive_silent_skips: u32 = 0;
+        // Committed transcript fed back as initial_prompt tail for the next window.
         let mut committed = config.prompt.clone().unwrap_or_default();
         let mut speech_started = false;
 
@@ -413,14 +434,18 @@ impl TranscriptionBackend for LocalWhisperBackend {
                         "skipping silent window at samples {}..{}",
                         window_start, window_end
                     );
+                    consecutive_silent_skips += 1;
                 } else {
+                    let omit_prompt =
+                        consecutive_silent_skips >= SILENT_SKIPS_BEFORE_OMIT_PROMPT;
+                    consecutive_silent_skips = 0;
                     process_stream_window(
                         &infer_tx,
                         &window,
                         &config.language,
                         &mut committed,
-                        &mut dedup,
                         &text_tx,
+                        omit_prompt,
                     )
                     .await;
                 }
@@ -444,8 +469,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 &remaining,
                 &config.language,
                 &mut committed,
-                &mut dedup,
                 &text_tx,
+                false,
             )
             .await;
         }
