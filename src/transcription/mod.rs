@@ -46,6 +46,19 @@ pub struct TranscriptionConfig {
     pub model: String,
     /// Optional prompt hint for the transcription model (vocabulary, context).
     pub prompt: Option<String>,
+    /// When true, keep ASR smart punctuation (e.g. Deepgram smart_format).
+    pub smart_punctuation: bool,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            language: "en".to_string(),
+            model: String::new(),
+            prompt: None,
+            smart_punctuation: false,
+        }
+    }
 }
 
 /// Trait for transcription backends.

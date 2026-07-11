@@ -274,6 +274,11 @@ pub struct GeneralConfig {
     /// Enable bottom-screen recording overlay.
     #[serde(default)]
     pub overlay: bool,
+    /// When false (dictation default), strip trailing `.`, `?`, and `!` that
+    /// streaming ASR adds at pause boundaries. Deepgram smart_format follows
+    /// this setting too.
+    #[serde(default)]
+    pub smart_punctuation: bool,
 }
 
 impl Default for GeneralConfig {
@@ -291,8 +296,30 @@ impl Default for GeneralConfig {
             prompt: None,
             tray: true,
             overlay: false,
+            smart_punctuation: false,
         }
     }
+}
+
+/// Remove trailing sentence-ending punctuation from a dictation batch.
+///
+/// Streaming backends often finalize each pause with `.`, `?`, or `!` even
+/// when the speaker is mid-thought. Dictation reads better as continuous
+/// speech without those clause terminators.
+pub fn strip_trailing_sentence_punctuation(text: &str) -> String {
+    let mut s = text.trim().to_string();
+    if s.is_empty() {
+        return s;
+    }
+    const TERMINATORS: [char; 6] = ['.', '?', '!', '。', '？', '！'];
+    while let Some(last) = s.chars().last() {
+        if TERMINATORS.contains(&last) || last.is_whitespace() {
+            s.truncate(s.len() - last.len_utf8());
+        } else {
+            break;
+        }
+    }
+    s
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

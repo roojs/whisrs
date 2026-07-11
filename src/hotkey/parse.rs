@@ -43,6 +43,52 @@ pub fn parse_hotkey(s: &str) -> anyhow::Result<HotkeyBinding> {
     Ok(HotkeyBinding { modifiers, trigger })
 }
 
+/// Render a config hotkey string for humans (tooltips, tray menus).
+///
+/// `Super`/`Meta`/`Win` become "Windows key"; other parts keep familiar labels.
+pub fn format_hotkey_display(s: &str) -> String {
+    s.split('+')
+        .map(|part| format_hotkey_part(part.trim()))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+fn format_hotkey_part(part: &str) -> String {
+    match part.to_lowercase().as_str() {
+        "super" | "meta" | "win" | "hyper" => "Windows key".to_string(),
+        "ctrl" | "control" => "Ctrl".to_string(),
+        "alt" => "Alt".to_string(),
+        "shift" => "Shift".to_string(),
+        "space" => "Space".to_string(),
+        "enter" | "return" => "Enter".to_string(),
+        "escape" | "esc" => "Esc".to_string(),
+        "tab" => "Tab".to_string(),
+        "backspace" => "Backspace".to_string(),
+        "delete" | "del" => "Delete".to_string(),
+        "insert" | "ins" => "Insert".to_string(),
+        "pageup" | "pgup" => "Page Up".to_string(),
+        "pagedown" | "pgdn" => "Page Down".to_string(),
+        "up" => "Up".to_string(),
+        "down" => "Down".to_string(),
+        "left" => "Left".to_string(),
+        "right" => "Right".to_string(),
+        "f1" => "F1".to_string(),
+        "f2" => "F2".to_string(),
+        "f3" => "F3".to_string(),
+        "f4" => "F4".to_string(),
+        "f5" => "F5".to_string(),
+        "f6" => "F6".to_string(),
+        "f7" => "F7".to_string(),
+        "f8" => "F8".to_string(),
+        "f9" => "F9".to_string(),
+        "f10" => "F10".to_string(),
+        "f11" => "F11".to_string(),
+        "f12" => "F12".to_string(),
+        other if other.len() == 1 => other.to_uppercase(),
+        other => part.to_string(),
+    }
+}
+
 fn parse_modifier(s: &str) -> Option<Key> {
     match s.to_lowercase().as_str() {
         "super" | "meta" | "win" | "hyper" => Some(Key::KEY_LEFTMETA),
@@ -170,5 +216,18 @@ mod tests {
     #[test]
     fn parse_unknown_key_fails() {
         assert!(parse_hotkey("Super+Unknown").is_err());
+    }
+
+    #[test]
+    fn format_hotkey_display_super_is_windows_key() {
+        assert_eq!(
+            format_hotkey_display("Super+Shift+W"),
+            "Windows key + Shift + W"
+        );
+    }
+
+    #[test]
+    fn format_hotkey_display_ctrl_alt() {
+        assert_eq!(format_hotkey_display("Ctrl+Shift+W"), "Ctrl + Shift + W");
     }
 }

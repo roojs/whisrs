@@ -251,7 +251,20 @@ pub fn dedup_window_text(committed: &str, window_text: &str) -> String {
 fn strip_repeated_committed_prefix(committed: &str, text: &str) -> String {
     let committed_words: Vec<&str> = committed.split_whitespace().collect();
     let text_words: Vec<&str> = text.split_whitespace().collect();
-    if committed_words.is_empty() || text_words.len() < 2 {
+    if committed_words.is_empty() {
+        return text.to_string();
+    }
+    // Single-word echo of the last committed word (common when a streaming
+    // backend finalizes again after a brief silence gap).
+    if text_words.len() == 1
+        && words_match(
+            text_words[0],
+            committed_words[committed_words.len() - 1],
+        )
+    {
+        return String::new();
+    }
+    if text_words.len() < 2 {
         return text.to_string();
     }
 
@@ -682,6 +695,13 @@ mod tests {
             dedup_window_text(committed, window),
             "duplicate a bit"
         );
+    }
+
+    #[test]
+    fn dedup_window_text_drops_single_word_tail_echo() {
+        let committed = "Can we download the full network version";
+        assert_eq!(dedup_window_text(committed, "version"), "");
+        assert_eq!(dedup_window_text(committed, "version?"), "");
     }
 
     #[test]

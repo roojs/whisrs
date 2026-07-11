@@ -5,7 +5,7 @@
 //! by splitting audio at silence boundaries and sending each chunk
 //! independently.
 
-use asr_dedup::{TextDedup, TimestampDedup, Word as AsrWord};
+use asr_dedup::TextDedup;
 use async_trait::async_trait;
 use audio_silence_gate::is_silent;
 use reqwest::multipart;
@@ -125,16 +125,6 @@ pub struct GroqWord {
     pub end: f64,
 }
 
-impl From<&GroqWord> for AsrWord {
-    fn from(w: &GroqWord) -> Self {
-        Self {
-            text: w.word.clone(),
-            start_secs: w.start,
-            end_secs: w.end,
-        }
-    }
-}
-
 /// Error response from the Groq API.
 #[derive(Debug, Deserialize)]
 pub struct GroqErrorResponse {
@@ -239,7 +229,6 @@ impl TranscriptionBackend for GroqBackend {
         text_tx: mpsc::Sender<String>,
         config: &TranscriptionConfig,
     ) -> anyhow::Result<()> {
-        let mut timestamp_dedup = TimestampDedup::new();
         let mut text_dedup = TextDedup::new();
         let mut buffer: Vec<i16> = Vec::new();
         let mut silence_count: usize = 0;
@@ -271,18 +260,9 @@ impl TranscriptionBackend for GroqBackend {
                 if wav_data.len() <= MAX_FILE_SIZE {
                     match self.send_chunk(&wav_data, config).await {
                         Ok(resp) => {
-                            let text = if !resp.words.is_empty() {
-                                let words: Vec<AsrWord> =
-                                    resp.words.iter().map(Into::into).collect();
-                                let accepted = timestamp_dedup.filter_words(&words);
-                                accepted
-                                    .iter()
-                                    .map(|w| w.text.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            } else {
-                                text_dedup.filter_text(&resp.text)
-                            };
+                            // Chunks are split at silence with no audio overlap,
+                            // so text-anchor dedup is the correct strategy here.
+                            let text = text_dedup.filter_text(resp.text.trim());
 
                             if !text.is_empty() {
                                 text_tx.send(text).await.ok();
@@ -293,7 +273,6 @@ impl TranscriptionBackend for GroqBackend {
                         }
                     }
 
-                    timestamp_dedup.advance_offset(chunk_duration);
                 } else {
                     warn!(
                         "groq stream: chunk too large ({} bytes), skipping",
@@ -319,17 +298,7 @@ impl TranscriptionBackend for GroqBackend {
             if wav_data.len() <= MAX_FILE_SIZE {
                 match self.send_chunk(&wav_data, config).await {
                     Ok(resp) => {
-                        let text = if !resp.words.is_empty() {
-                            let words: Vec<AsrWord> = resp.words.iter().map(Into::into).collect();
-                            let accepted = timestamp_dedup.filter_words(&words);
-                            accepted
-                                .iter()
-                                .map(|w| w.text.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        } else {
-                            text_dedup.filter_text(&resp.text)
-                        };
+                        let text = text_dedup.filter_text(resp.text.trim());
 
                         if !text.is_empty() {
                             text_tx.send(text).await.ok();

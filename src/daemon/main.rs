@@ -7,6 +7,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use asr_dedup::dedup_window_text;
 use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SILENCE_RMS_THRESHOLD};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
@@ -27,7 +28,8 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
-    encode_message, read_message, socket_path, Command, Config, InjectorBackend, Response, State,
+    encode_message, read_message, socket_path, strip_trailing_sentence_punctuation, Command,
+    Config, InjectorBackend, Response, State,
 };
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
@@ -761,7 +763,8 @@ async fn main() -> Result<()> {
     // Start system tray if enabled.
     // Spawned as a background task so retries don't block the IPC server.
     if tray_enabled {
-        tokio::spawn(whisrs::tray::spawn_tray(state_rx.clone()));
+        let tray_hotkeys = context.config.hotkeys.clone();
+        tokio::spawn(whisrs::tray::spawn_tray(state_rx.clone(), tray_hotkeys));
     }
 
     // Start bottom recording overlay if enabled.
@@ -1052,6 +1055,7 @@ async fn handle_toggle(
                 let pipeline_state_tx = context.state_tx.clone();
                 let pipeline_key_delay = key_delay;
                 let pipeline_injector_backend = injector_backend;
+                let pipeline_smart_punctuation = context.config.general.smart_punctuation;
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -1074,6 +1078,7 @@ async fn handle_toggle(
                         pipeline_key_delay,
                         pipeline_injector_backend,
                         buffer_hint_for_pipeline,
+                        pipeline_smart_punctuation,
                     )
                     .await
                 });
@@ -1275,6 +1280,7 @@ async fn run_streaming_pipeline(
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
     buffer_hint: Option<Arc<BufferHint>>,
+    smart_punctuation: bool,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -1335,6 +1341,22 @@ async fn run_streaming_pipeline(
             // Apply filler word removal if enabled.
             if let Some(filter) = filler_filter.as_ref() {
                 batch = filter.apply(&batch);
+                if batch.is_empty() {
+                    continue;
+                }
+            }
+
+            // Drop overlap with text already typed this session. Streaming
+            // backends (Deepgram, Groq chunks, server VAD) emit a fresh final
+            // after each pause; without this, the last word is often repeated.
+            batch = dedup_window_text(&full_text, &batch);
+            if batch.trim().is_empty() {
+                debug!("skipping duplicate streaming batch after dedup");
+                continue;
+            }
+
+            if !smart_punctuation {
+                batch = strip_trailing_sentence_punctuation(&batch);
                 if batch.is_empty() {
                     continue;
                 }
@@ -1893,6 +1915,10 @@ async fn process_recording_batch(
         text
     };
 
+    if !context.config.general.smart_punctuation {
+        text = strip_trailing_sentence_punctuation(&text);
+    }
+
     if text.is_empty() {
         info!("transcription returned empty text — nothing to type");
         return Ok(text);
@@ -2095,6 +2121,7 @@ fn build_transcription_config(config: &Config) -> TranscriptionConfig {
         language: config.general.language.clone(),
         model: get_model_for_backend(config),
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
+        smart_punctuation: config.general.smart_punctuation,
     }
 }
 

@@ -56,7 +56,7 @@ fn build_query_params<'a>(
     let mut params = vec![
         ("model", config.model.as_str()),
         ("language", map_language(&config.language)),
-        ("smart_format", "true"),
+        ("smart_format", if config.smart_punctuation { "true" } else { "false" }),
     ];
     params.extend_from_slice(extra);
     params
@@ -525,9 +525,9 @@ mod tests {
     #[test]
     fn build_query_params_includes_smart_format() {
         let config = TranscriptionConfig {
-            language: "en".to_string(),
             model: "nova-3".to_string(),
-            prompt: None,
+            smart_punctuation: true,
+            ..Default::default()
         };
         let params = build_query_params(&config, &[]);
         assert!(params
@@ -535,6 +535,18 @@ mod tests {
             .any(|(k, v)| *k == "smart_format" && *v == "true"));
         assert!(params.iter().any(|(k, v)| *k == "model" && *v == "nova-3"));
         assert!(params.iter().any(|(k, v)| *k == "language" && *v == "en"));
+    }
+
+    #[test]
+    fn build_query_params_disables_smart_format_when_off() {
+        let config = TranscriptionConfig {
+            model: "nova-3".to_string(),
+            ..Default::default()
+        };
+        let params = build_query_params(&config, &[]);
+        assert!(params
+            .iter()
+            .any(|(k, v)| *k == "smart_format" && *v == "false"));
     }
 
     #[test]

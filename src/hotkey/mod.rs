@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{Command, HotkeyConfig};
-pub use parse::{parse_hotkey, HotkeyBinding};
+pub use parse::{format_hotkey_display, parse_hotkey, HotkeyBinding};
 
 /// Maximum number of attempts to find keyboard input devices.
 const HOTKEY_MAX_RETRIES: u32 = 10;

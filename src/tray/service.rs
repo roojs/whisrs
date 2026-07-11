@@ -1,10 +1,12 @@
 //! System tray implementation using ksni (StatusNotifierItem).
 
+use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Icon, ToolTip, TrayMethods};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::State;
+use crate::hotkey::format_hotkey_display;
+use crate::{HotkeyConfig, State};
 
 /// 16x16 ARGB icon data for each state.
 /// Format: each pixel is 4 bytes (ARGB, big-endian).
@@ -67,6 +69,7 @@ mod icons {
 /// miss icon refreshes and leave the old color visible.
 struct TrayState {
     current: State,
+    hotkeys: Option<HotkeyConfig>,
 }
 
 /// The ksni tray implementation.
@@ -74,18 +77,60 @@ struct WhisrsTray {
     state: TrayState,
 }
 
+impl WhisrsTray {
+    fn status_text(state: State) -> &'static str {
+        match state {
+            State::Idle => "Idle — ready to record",
+            State::Recording => "Recording — press toggle again to stop",
+            State::Transcribing => "Transcribing…",
+            State::Synthesizing => "Synthesizing speech…",
+            State::Speaking => "Reading selection aloud…",
+        }
+    }
+
+    fn summary(state: State, hotkeys: &Option<HotkeyConfig>) -> String {
+        let status = Self::status_text(state);
+        if let Some(toggle) = hotkeys.as_ref().and_then(|hk| hk.toggle.as_deref()) {
+            format!("{status}\nRecord/stop: {}", format_hotkey_display(toggle))
+        } else {
+            format!("{status}\nNo hotkey configured")
+        }
+    }
+
+    fn info_menu_item(label: String) -> MenuItem<Self> {
+        StandardItem {
+            label,
+            enabled: false,
+            activate: Box::new(|_| {}),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 impl ksni::Tray for WhisrsTray {
+    /// On GNOME the tray host opens the menu on click rather than showing
+    /// hover tooltips, so a menu is the reliable way to surface shortcuts.
+    const MENU_ON_ACTIVATE: bool = true;
+
     fn id(&self) -> String {
         "whisrs".to_string()
     }
 
     fn title(&self) -> String {
-        match self.state.current {
-            State::Idle => "whisrs — idle".to_string(),
-            State::Recording => "whisrs — recording".to_string(),
-            State::Transcribing => "whisrs — transcribing".to_string(),
-            State::Synthesizing => "whisrs — synthesizing".to_string(),
-            State::Speaking => "whisrs — speaking".to_string(),
+        if let Some(toggle) = self
+            .state
+            .hotkeys
+            .as_ref()
+            .and_then(|hk| hk.toggle.as_deref())
+        {
+            format!(
+                "whisrs — {} ({})",
+                Self::status_text(self.state.current),
+                format_hotkey_display(toggle)
+            )
+        } else {
+            format!("whisrs — {}", Self::status_text(self.state.current))
         }
     }
 
@@ -105,19 +150,57 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let description = match self.state.current {
-            State::Idle => "Idle — ready to record",
-            State::Recording => "Recording...",
-            State::Transcribing => "Transcribing...",
-            State::Synthesizing => "Synthesizing…",
-            State::Speaking => "Reading aloud…",
-        };
+        let description = Self::summary(self.state.current, &self.state.hotkeys);
         ToolTip {
             title: "whisrs".to_string(),
-            description: description.to_string(),
+            description,
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
         }
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        let mut items = vec![Self::info_menu_item(Self::status_text(
+            self.state.current,
+        ))];
+
+        if let Some(hotkeys) = &self.state.hotkeys {
+            if let Some(toggle) = hotkeys.toggle.as_deref() {
+                items.push(Self::info_menu_item(format!(
+                    "Record/stop: {}",
+                    format_hotkey_display(toggle)
+                )));
+            }
+            if let Some(cancel) = hotkeys.cancel.as_deref() {
+                items.push(Self::info_menu_item(format!(
+                    "Cancel: {}",
+                    format_hotkey_display(cancel)
+                )));
+            }
+            if let Some(command) = hotkeys.command.as_deref() {
+                items.push(Self::info_menu_item(format!(
+                    "Command mode: {}",
+                    format_hotkey_display(command)
+                )));
+            }
+            if let Some(speak) = hotkeys.speak.as_deref() {
+                items.push(Self::info_menu_item(format!(
+                    "Read aloud: {}",
+                    format_hotkey_display(speak)
+                )));
+            }
+        } else {
+            items.push(Self::info_menu_item(
+                "No hotkeys in config — run whisrs toggle".to_string(),
+            ));
+        }
+
+        items.push(MenuItem::Separator);
+        items.push(Self::info_menu_item(
+            "On GNOME: click this icon for shortcuts (no hover tooltip)".to_string(),
+        ));
+
+        items
     }
 }
 
@@ -132,7 +215,7 @@ const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 /// Runs in the background and updates the icon whenever the daemon state changes.
 /// Retries with exponential backoff if the SNI host isn't available yet (common
 /// on boot when the daemon starts before the desktop environment is fully ready).
-pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
+pub async fn spawn_tray(mut state_rx: watch::Receiver<State>, hotkeys: Option<HotkeyConfig>) {
     // Retry spawning the tray with exponential backoff.
     let mut delay = TRAY_INITIAL_DELAY;
     let mut handle = None;
@@ -141,6 +224,7 @@ pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
         let tray = WhisrsTray {
             state: TrayState {
                 current: *state_rx.borrow(),
+                hotkeys: hotkeys.clone(),
             },
         };
 

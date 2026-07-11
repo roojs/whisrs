@@ -11,6 +11,9 @@ mod service;
 pub use service::spawn_tray;
 
 #[cfg(not(feature = "tray"))]
-pub async fn spawn_tray(_state_rx: tokio::sync::watch::Receiver<crate::State>) {
+pub async fn spawn_tray(
+    _state_rx: tokio::sync::watch::Receiver<crate::State>,
+    _hotkeys: Option<crate::HotkeyConfig>,
+) {
     // Tray feature not enabled — no-op.
 }
