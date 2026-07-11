@@ -119,12 +119,15 @@ systemctl --user enable --now whisrs.service
 To build a `.deb` locally (needs Rust stable via rustup, not apt's older cargo):
 
 ```bash
-sudo apt install debhelper libasound2-dev libxkbcommon-dev pkg-config libclang-dev cmake
+sudo apt install debhelper libasound2-dev libxkbcommon-dev pkg-config \
+  libclang-dev cmake libvulkan-dev glslc vulkan-tools mesa-vulkan-drivers
 git clone https://github.com/y0sif/whisrs
 cd whisrs
 ./scripts/build-deb.sh
 sudo dpkg -i ../whisrs_*_amd64.deb
 ```
+
+Full `.deb` builds compile whisper.cpp with Vulkan GPU support. Install a Vulkan driver (`mesa-vulkan-drivers` for Intel/AMD, or your vendor driver for NVIDIA) before using `local-whisper`.
 
 For a cloud-only package (no whisper.cpp), run `./scripts/build-deb.sh --minimal`.
 

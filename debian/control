@@ -9,7 +9,9 @@ Build-Depends: debhelper-compat (= 13),
                libxkbcommon-dev,
                pkg-config,
                libclang-dev,
-               cmake
+               cmake,
+               libvulkan-dev,
+               glslc
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Homepage: https://y0sif.github.io/whisrs/
@@ -23,8 +25,11 @@ Depends: ${misc:Depends},
          ${shlibs:Depends},
          libasound2 (>= 1.0.16) | libasound2t64,
          libxkbcommon0 (>= 0.5.0),
+         libvulkan1,
          ca-certificates
-Recommends: acl
+Recommends: acl,
+             vulkan-tools,
+             mesa-vulkan-drivers
 Description: Linux-first voice-to-text dictation tool
  whisrs is a voice dictation system for Linux desktops and compositors.
  Press a hotkey, speak, and transcribed text is typed at the cursor.
@@ -32,4 +37,5 @@ Description: Linux-first voice-to-text dictation tool
  This package installs the whisrs CLI client, the whisrsd background
  daemon, a systemd user unit, and a udev rule for /dev/uinput access.
  Cloud backends (Groq, Deepgram, OpenAI) and offline whisper.cpp are
- included in the default build.
+ included in the default build. whisper.cpp is compiled with Vulkan GPU
+ acceleration when a compatible driver is installed.

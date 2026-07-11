@@ -17,7 +17,11 @@ FEATURES ?=
 CARGO ?= cargo
 
 override_dh_auto_build:
+ifeq ($(findstring --no-default-features,$(FEATURES)),--no-default-features)
 	$(CARGO) build --release --locked $(FEATURES)
+else
+	GGML_VULKAN=1 $(CARGO) build --release --locked --features local-whisper-vulkan $(FEATURES)
+endif
 
 override_dh_auto_install:
 	install -d debian/whisrs/usr/bin

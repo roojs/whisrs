@@ -36,6 +36,7 @@ path = "src/daemon/main.rs"
 [features]
 default = ["local-whisper", "tray", "overlay"]
 local-whisper = ["dep:whisper-rs"]
+local-whisper-vulkan = ["local-whisper", "whisper-rs/vulkan"]
 tray = ["dep:ksni"]
 overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:tiny-skia"]
 

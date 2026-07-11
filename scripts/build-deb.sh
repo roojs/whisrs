@@ -6,7 +6,8 @@
 #   ./scripts/build-deb.sh --minimal
 #
 # Requires a recent Rust toolchain (same as CI: stable via rustup) plus:
-#   sudo apt install debhelper libasound2-dev libxkbcommon-dev pkg-config libclang-dev cmake
+#   sudo apt install debhelper libasound2-dev libxkbcommon-dev pkg-config \
+#     libclang-dev cmake libvulkan-dev glslc
 #
 # Pre-built .deb packages are also published on GitHub Releases (see release.yml).
 
