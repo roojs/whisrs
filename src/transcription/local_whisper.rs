@@ -87,7 +87,7 @@ fn inference_thread_count() -> i32 {
 }
 
 fn configure_full_params(
-    params: &mut whisper_rs::FullParams<'_>,
+    params: &mut whisper_rs::FullParams<'_, '_>,
     language: &str,
     prompt: Option<&str>,
     streaming: bool,
@@ -178,10 +178,9 @@ fn start_stream_infer_thread(
             let mut state = match ctx.create_state() {
                 Ok(state) => state,
                 Err(e) => {
-                    let err =
-                        anyhow::anyhow!("failed to create whisper streaming state: {e}");
+                    let err = format!("failed to create whisper streaming state: {e}");
                     while let Ok(job) = job_rx.recv() {
-                        let _ = job.result_tx.send(Err(err.clone()));
+                        let _ = job.result_tx.send(Err(anyhow::anyhow!("{err}")));
                     }
                     return;
                 }
