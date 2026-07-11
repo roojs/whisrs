@@ -1080,6 +1080,22 @@ impl KeyInjector for WaylandVkKeyboard {
         Ok(())
     }
 
+    fn select_left(&mut self, count: usize) -> anyhow::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        if !self.keymap_uploaded {
+            self.upload_keymap(&[])?;
+        }
+        let left = u32::from(evdev::Key::KEY_LEFT.code()) + 8;
+        self.set_modifiers(SHIFT_MOD_MASK)?;
+        for _ in 0..count {
+            self.tap_keycode(left)?;
+        }
+        self.set_modifiers(0)?;
+        Ok(())
+    }
+
     fn send_combo(&mut self, keys: &[evdev::Key]) -> anyhow::Result<()> {
         if !self.keymap_uploaded {
             self.upload_keymap(&[])?;

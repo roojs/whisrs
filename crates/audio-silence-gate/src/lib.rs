@@ -116,50 +116,6 @@ pub fn audio_gate_reason(
     None
 }
 
-/// Tracks whether the user has started speaking yet.
-///
-/// Leading silence at the start of a recording is normal — auto-stop and
-/// streaming inference should not treat it as "done" or send it to ASR until
-/// speech energy is detected at least once.
-pub struct SpeechStartGate {
-    threshold: f64,
-    speech_detected: bool,
-}
-
-impl SpeechStartGate {
-    /// Create a gate using the given normalized RMS threshold.
-    pub fn new(threshold: f64) -> Self {
-        Self {
-            threshold,
-            speech_detected: false,
-        }
-    }
-
-    /// Feed a chunk of audio. Returns `true` once speech has been detected.
-    pub fn feed(&mut self, samples: &[i16]) -> bool {
-        if !self.speech_detected && !is_silent(samples, self.threshold) {
-            self.speech_detected = true;
-        }
-        self.speech_detected
-    }
-
-    /// Whether any speech has been detected since creation or last reset.
-    pub fn has_speech(&self) -> bool {
-        self.speech_detected
-    }
-
-    /// Reset the gate (e.g. for a new recording session).
-    pub fn reset(&mut self) {
-        self.speech_detected = false;
-    }
-}
-
-impl Default for SpeechStartGate {
-    fn default() -> Self {
-        Self::new(SILENCE_RMS_THRESHOLD)
-    }
-}
-
 /// Tracks consecutive silent frames and signals when silence has exceeded
 /// a configured timeout, enabling auto-stop of recording.
 pub struct AutoStopDetector {
@@ -450,33 +406,5 @@ mod tests {
         // Feed exactly 1600 silent samples.
         let silence = vec![0i16; 1600];
         assert!(detector.feed(&silence));
-    }
-
-    // --- SpeechStartGate tests ---
-
-    #[test]
-    fn speech_gate_stays_false_during_leading_silence() {
-        let mut gate = SpeechStartGate::new(0.01);
-        let silence = vec![0i16; 16_000];
-        assert!(!gate.feed(&silence));
-        assert!(!gate.feed(&silence));
-        assert!(!gate.has_speech());
-    }
-
-    #[test]
-    fn speech_gate_flips_on_loud_audio() {
-        let mut gate = SpeechStartGate::new(0.01);
-        let loud: Vec<i16> = vec![10_000; 1_600];
-        assert!(gate.feed(&loud));
-        assert!(gate.has_speech());
-    }
-
-    #[test]
-    fn speech_gate_reset() {
-        let mut gate = SpeechStartGate::new(0.01);
-        let loud: Vec<i16> = vec![10_000; 1_600];
-        gate.feed(&loud);
-        gate.reset();
-        assert!(!gate.has_speech());
     }
 }

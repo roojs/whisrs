@@ -80,6 +80,9 @@ pub trait KeyInjector: Send {
     /// Emit Backspace `count` times.
     fn backspace(&mut self, count: usize) -> anyhow::Result<()>;
 
+    /// Extend the selection left by `count` character positions (Shift+Left).
+    fn select_left(&mut self, count: usize) -> anyhow::Result<()>;
+
     /// Press all keys in `keys`, then release them in reverse order.
     fn send_combo(&mut self, keys: &[evdev::Key]) -> anyhow::Result<()>;
 
@@ -94,6 +97,10 @@ impl KeyInjector for Keyboard {
 
     fn backspace(&mut self, count: usize) -> anyhow::Result<()> {
         Keyboard::backspace(self, count)
+    }
+
+    fn select_left(&mut self, count: usize) -> anyhow::Result<()> {
+        Keyboard::select_left(self, count)
     }
 
     fn send_combo(&mut self, keys: &[evdev::Key]) -> anyhow::Result<()> {

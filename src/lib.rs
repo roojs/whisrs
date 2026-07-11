@@ -338,10 +338,10 @@ pub struct InputConfig {
     /// backend can only emit characters present in the active XKB layout.
     #[serde(default)]
     pub backend: InjectorBackend,
-    /// Experimental: show in-field status at the cursor while recording:
-    /// `Silence...` until you start speaking, then `Buffering N...` while
-    /// waiting for the first transcript. Keep the cursor in your target field
-    /// for the whole recording. Opt in with `buffer_countdown = true`.
+    /// Experimental: show provisional status at the cursor while recording
+    /// (`Silence...`, then `Buffering N...`). Updates replace the highlighted
+    /// hint instead of backspacing. Keep the cursor in your target field.
+    /// Opt in with `buffer_countdown = true`.
     #[serde(default)]
     pub buffer_countdown: Option<bool>,
 }

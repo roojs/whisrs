@@ -224,6 +224,34 @@ impl Keyboard {
         Ok(())
     }
 
+    /// Extend the selection left by `count` character positions (Shift+Left).
+    pub fn select_left(&mut self, count: usize) -> anyhow::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        self.release_all_modifiers()?;
+        self.set_modifier(Key::KEY_LEFTSHIFT, true)?;
+
+        for _ in 0..count {
+            self.device.emit(&[InputEvent::new(
+                EventType::KEY,
+                Key::KEY_LEFT.code(),
+                1,
+            )])?;
+            thread::sleep(self.key_delay);
+            self.device.emit(&[InputEvent::new(
+                EventType::KEY,
+                Key::KEY_LEFT.code(),
+                0,
+            )])?;
+            thread::sleep(self.key_delay);
+        }
+
+        self.set_modifier(Key::KEY_LEFTSHIFT, false)?;
+        Ok(())
+    }
+
     /// Press all keys in `keys`, then release them in reverse order.
     ///
     /// Each press and release is separated by `self.key_delay`.

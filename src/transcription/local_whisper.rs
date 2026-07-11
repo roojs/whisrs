@@ -379,15 +379,16 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let mut last_processed_end: usize = 0;
         // Committed transcript fed back as initial_prompt for the next window.
         let mut committed = config.prompt.clone().unwrap_or_default();
-        let mut speech_gate =
-            audio_silence_gate::SpeechStartGate::new(audio_silence_gate::SILENCE_RMS_THRESHOLD);
+        let mut speech_started = false;
 
         while let Some(chunk) = audio_rx.recv().await {
-            speech_gate.feed(&chunk);
+            if !speech_started && !audio_silence_gate::is_silent(&chunk, audio_silence_gate::SILENCE_RMS_THRESHOLD) {
+                speech_started = true;
+            }
             buffer.extend_from_slice(&chunk);
 
             while buffer.len() >= next_process_at {
-                if !speech_gate.has_speech() {
+                if !speech_started {
                     debug!(
                         "leading silence — skipping inference until speech (at sample {})",
                         next_process_at

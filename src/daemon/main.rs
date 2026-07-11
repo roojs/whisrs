@@ -7,7 +7,7 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SpeechStartGate, SILENCE_RMS_THRESHOLD};
+use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SILENCE_RMS_THRESHOLD};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
 use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
@@ -974,6 +974,13 @@ async fn handle_toggle(
                 None
             };
 
+            // Play the start tone before opening the mic so it is not transcribed.
+            if context.config.general.audio_feedback {
+                let volume = context.config.general.audio_feedback_volume;
+                let _ = tokio::task::spawn_blocking(move || feedback::play_start_blocking(volume))
+                    .await;
+            }
+
             // Start recording.
             let mut capture =
                 match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
@@ -1084,9 +1091,6 @@ async fn handle_toggle(
                     info!("started recording");
                     // Broadcast recording state for tray.
                     let _ = context.state_tx.send(new_state);
-                    if context.config.general.audio_feedback {
-                        feedback::play_start(context.config.general.audio_feedback_volume);
-                    }
                     if context.notify_state() {
                         send_notification("whisrs", "Recording...");
                     }
@@ -1122,14 +1126,11 @@ async fn handle_toggle(
                     if let Some(level_tx) = &context.overlay_level_tx {
                         let _ = level_tx.send(0.0);
                     }
-                    if context.config.general.audio_feedback {
-                        feedback::play_stop(context.config.general.audio_feedback_volume);
-                    }
                     if context.notify_state() {
                         send_notification("whisrs", "Transcribing...");
                     }
 
-                    let capture = ds.audio_capture.take();
+                    let mut capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
                     let recording_started_at = ds.recording_started_at.take();
@@ -1137,11 +1138,20 @@ async fn handle_toggle(
                     // Release lock before slow operations.
                     drop(ds);
 
+                    // Stop the microphone before the stop tone so it is not transcribed.
+                    if let Some(ref mut cap) = capture {
+                        cap.stop();
+                    }
+                    if context.config.general.audio_feedback {
+                        let volume = context.config.general.audio_feedback_volume;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            feedback::play_stop_blocking(volume)
+                        })
+                        .await;
+                    }
+
                     let result = if let Some(task) = streaming_task {
-                        // Streaming path: stop capture to close the channel,
-                        // then wait for the pipeline to drain and finish.
-                        if let Some(mut cap) = capture {
-                            cap.stop();
+                        if let Some(cap) = capture {
                             tokio::task::spawn_blocking(move || drop(cap));
                         }
                         match task.await {
@@ -1360,7 +1370,7 @@ async fn run_streaming_pipeline(
             full_text.push_str(&text_to_type);
 
             info!("typing: {:?}", text_to_type);
-            let clear_hint_len = if !hint_cleared {
+            let replace_hint_len = if !hint_cleared {
                 hint_cleared = true;
                 buffer_hint_for_typing
                     .as_ref()
@@ -1376,7 +1386,7 @@ async fn run_streaming_pipeline(
                     &text_to_type,
                     wid_for_insert.as_deref(),
                     tracker_for_insert.as_ref(),
-                    clear_hint_len,
+                    replace_hint_len,
                     key_delay,
                     injector_backend,
                 )
@@ -1395,15 +1405,13 @@ async fn run_streaming_pipeline(
     // Forward audio from capture to backend, with auto-stop detection.
     let mut auto_stop =
         AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
-    let mut speech_gate = SpeechStartGate::new(SILENCE_RMS_THRESHOLD);
     let mut buffering_countdown_started = false;
 
     while let Some(chunk) = audio_rx.recv().await {
-        let had_speech = speech_gate.has_speech();
-        speech_gate.feed(&chunk);
+        let had_speech = auto_stop.has_speech();
 
         if let (Some(hint), Some(wid)) = (&buffer_hint, &window_id) {
-            if !buffering_countdown_started && speech_gate.has_speech() && !had_speech {
+            if !buffering_countdown_started && !had_speech && !audio_silence_gate::is_silent(&chunk, SILENCE_RMS_THRESHOLD) {
                 buffering_countdown_started = true;
                 hint.start_buffering();
                 let hint_clone = Arc::clone(hint);
@@ -1708,12 +1716,12 @@ fn clear_buffer_hint_at_target(
     }
 }
 
-/// Focus the insert target, optionally clear a hint, then type text.
+/// Focus the insert target, select any provisional hint text, then replace it.
 fn insert_at_target(
     text: &str,
     window_id: Option<&str>,
     tracker: &dyn WindowTracker,
-    clear_hint_len: usize,
+    replace_hint_len: usize,
     key_delay: std::time::Duration,
     backend: InjectorBackend,
 ) -> Result<()> {
@@ -1724,23 +1732,6 @@ fn insert_at_target(
                 .context("failed to focus insert target")?;
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    }
-    if clear_hint_len > 0 {
-        backspace_at_cursor(clear_hint_len, key_delay, backend)?;
-    }
-    if !text.is_empty() {
-        type_text_at_cursor(text, key_delay, backend)?;
-    }
-    Ok(())
-}
-
-fn backspace_at_cursor(
-    count: usize,
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
-) -> Result<()> {
-    if count == 0 {
-        return Ok(());
     }
 
     let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
@@ -1757,9 +1748,19 @@ fn backspace_at_cursor(
         .expect("keyboard exists after initialization");
     keyboard.set_key_delay(key_delay);
 
-    let result = keyboard
-        .backspace(count)
-        .context("failed to backspace over buffer hint");
+    if replace_hint_len > 0 {
+        keyboard.select_left(replace_hint_len)?;
+    }
+    let result = if text.is_empty() {
+        if replace_hint_len > 0 {
+            keyboard.backspace(1)
+        } else {
+            Ok(())
+        }
+    } else {
+        keyboard.type_text(text)
+    }
+    .context("failed to insert text at target");
     if result.is_err() {
         *keyboard_guard = None;
     }
@@ -2261,7 +2262,8 @@ async fn command_mode_start(
 
     // Step 2: Start recording voice instruction.
     if context.config.general.audio_feedback {
-        feedback::play_start(context.config.general.audio_feedback_volume);
+        let volume = context.config.general.audio_feedback_volume;
+        let _ = tokio::task::spawn_blocking(move || feedback::play_start_blocking(volume)).await;
     }
 
     let mut capture =

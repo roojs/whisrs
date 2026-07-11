@@ -1,8 +1,9 @@
 //! Audio feedback — play subtle tones on recording start, stop, and completion.
 //!
 //! Generates simple tones programmatically using `cpal` for playback on the
-//! default output device. Each play function spawns a thread so it never
-//! blocks the caller.
+//! default output device. Non-blocking helpers spawn a thread; blocking helpers
+//! wait for playback to finish (use those around microphone open/close so the
+//! mic does not pick up the tones).
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
@@ -15,22 +16,26 @@ const TONE_SAMPLE_RATE: u32 = 44_100;
 pub fn play_start(volume: f32) {
     std::thread::Builder::new()
         .name("whisrs-feedback".into())
-        .spawn(move || {
-            let samples = generate_sweep(800.0, 1200.0, 0.15, volume);
-            play_samples(&samples);
-        })
+        .spawn(move || play_start_blocking(volume))
         .ok();
+}
+
+/// Blocking — call before opening the microphone so the tone is not transcribed.
+pub fn play_start_blocking(volume: f32) {
+    play_samples(&generate_sweep(800.0, 1200.0, 0.15, volume));
 }
 
 /// Play the "stop recording" sound: a short falling tone (1200Hz -> 800Hz, ~150ms).
 pub fn play_stop(volume: f32) {
     std::thread::Builder::new()
         .name("whisrs-feedback".into())
-        .spawn(move || {
-            let samples = generate_sweep(1200.0, 800.0, 0.15, volume);
-            play_samples(&samples);
-        })
+        .spawn(move || play_stop_blocking(volume))
         .ok();
+}
+
+/// Blocking — call after the microphone has stopped capturing.
+pub fn play_stop_blocking(volume: f32) {
+    play_samples(&generate_sweep(1200.0, 800.0, 0.15, volume));
 }
 
 /// Play the "done" sound: a soft double beep (~200ms total).
@@ -41,7 +46,6 @@ pub fn play_done(volume: f32) {
             let beep1 = generate_tone(1000.0, 0.07, volume);
             let silence = vec![0.0f32; (TONE_SAMPLE_RATE as f32 * 0.06) as usize];
             let beep2 = generate_tone(1200.0, 0.07, volume);
-
             let mut samples = Vec::with_capacity(beep1.len() + silence.len() + beep2.len());
             samples.extend_from_slice(&beep1);
             samples.extend_from_slice(&silence);
