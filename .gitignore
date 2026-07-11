@@ -10,3 +10,14 @@ crates/*/Cargo.lock
 .worktrees/
 .deepseek/
 .claude/
+
+# Debian package build artifacts
+debian/deb-tmp/
+debian/cargo_home/
+debian/.debhelper/
+debian/whisrs/
+debian/tmp/
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/debhelper-build-stamp

@@ -42,7 +42,7 @@ To **build from source** instead — including custom feature flag combos or uns
 After install, **press your hotkey** to start recording, **press again** to stop. Text appears at your cursor.
 
 <details>
-<summary><b>Other install methods (pre-built binary, AUR, Cargo, Nix, manual)</b></summary>
+<summary><b>Other install methods (pre-built binary, AUR, Cargo, Nix, Debian, manual)</b></summary>
 
 ### Pre-built binary (manual)
 
@@ -100,6 +100,34 @@ Or add to your flake inputs:
 inputs.whisrs.url = "github:y0sif/whisrs";
 ```
 
+### Debian/Ubuntu (.deb)
+
+Pre-built `.deb` packages are published on [GitHub Releases](https://github.com/y0sif/whisrs/releases/latest) alongside the tarballs (full and minimal, amd64 and arm64). Built from source in CI on each tagged release.
+
+```bash
+# Pick the package for your arch + variant, e.g.:
+curl -sSLO https://github.com/y0sif/whisrs/releases/latest/download/whisrs_0.1.19-1_amd64.deb
+# cloud-only minimal build:
+# curl -sSLO https://github.com/y0sif/whisrs/releases/latest/download/whisrs_0.1.19-1_amd64-minimal.deb
+
+sudo dpkg -i whisrs_*_amd64.deb
+sudo usermod -aG input $USER   # log out / back in
+whisrs setup
+systemctl --user enable --now whisrs.service
+```
+
+To build a `.deb` locally (needs Rust stable via rustup, not apt's older cargo):
+
+```bash
+sudo apt install debhelper libasound2-dev libxkbcommon-dev pkg-config libclang-dev cmake
+git clone https://github.com/y0sif/whisrs
+cd whisrs
+./scripts/build-deb.sh
+sudo dpkg -i ../whisrs_*_amd64.deb
+```
+
+For a cloud-only package (no whisper.cpp), run `./scripts/build-deb.sh --minimal`.
+
 ### Manual install
 
 #### 1. Dependencies
@@ -109,7 +137,7 @@ inputs.whisrs.url = "github:y0sif/whisrs";
 sudo pacman -S base-devel alsa-lib libxkbcommon clang cmake
 
 # Debian/Ubuntu
-sudo apt install build-essential libasound2-dev libxkbcommon-dev libclang-dev cmake
+sudo apt install build-essential libasound2-dev libxkbcommon-dev libclang-dev cmake pkg-config
 
 # Fedora
 sudo dnf install gcc-c++ alsa-lib-devel libxkbcommon-devel clang-devel cmake
@@ -225,7 +253,7 @@ whisrs log --clear  # Clear all history
 
 ## Project Status
 
-whisrs is functional and usable for daily dictation. Streaming transcription, command mode, read-selection-aloud (TTS via Groq, OpenAI, Deepgram, or a local sidecar), multi-language support, system tray, OSD overlay, layout-aware injection (incl. AltGr + dead keys), the generic ASR sidecar backend (Moonshine, Parakeet, VibeVoice-ASR), and packaging for AUR / Nix / crates.io all ship today. Native local Vosk and Parakeet backends are next.
+whisrs is functional and usable for daily dictation. Streaming transcription, command mode, read-selection-aloud (TTS via Groq, OpenAI, Deepgram, or a local sidecar), multi-language support, system tray, OSD overlay, layout-aware injection (incl. AltGr + dead keys), the generic ASR sidecar backend (Moonshine, Parakeet, VibeVoice-ASR), and packaging for AUR / Nix / Debian / crates.io all ship today. Native local Vosk and Parakeet backends are next.
 
 Per-release details: [docs/version-roadmap.md](docs/version-roadmap.md).
 

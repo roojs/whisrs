@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE := 1
+export CARGO_HOME := $(CURDIR)/debian/cargo_home
+export CARGO_TARGET_DIR := $(CURDIR)/target/debian
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf debian/cargo_home target/debian
+
+# Override for cloud-only builds, e.g.:
+#   FEATURES="--no-default-features --features tray,overlay" dpkg-buildpackage -b -us -uc
+FEATURES ?=
+CARGO ?= cargo
+
+override_dh_auto_build:
+	$(CARGO) build --release --locked $(FEATURES)
+
+override_dh_auto_install:
+	install -d debian/whisrs/usr/bin
+	install -m755 target/debian/release/whisrs debian/whisrs/usr/bin/
+	install -m755 target/debian/release/whisrsd debian/whisrs/usr/bin/

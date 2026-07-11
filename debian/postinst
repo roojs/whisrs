@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if getent group input >/dev/null 2>&1; then
+            echo "whisrs: add your user to the input group for /dev/uinput access:"
+            echo "  sudo usermod -aG input \$USER"
+            echo "Then log out and back in, run 'whisrs setup', and optionally:"
+            echo "  systemctl --user enable --now whisrs.service"
+        else
+            echo "whisrs: the input group is missing on this system."
+            echo "Create it or adjust the udev rule before using virtual keyboard injection."
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

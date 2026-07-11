@@ -1,0 +1,2 @@
+contrib/99-whisrs.rules usr/lib/udev/rules.d/
+contrib/whisrs.service usr/lib/systemd/user/
