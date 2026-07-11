@@ -1082,7 +1082,7 @@ async fn handle_toggle(
             }
 
             ds.audio_capture = Some(capture);
-            ds.recording_window_id = window_id;
+            ds.recording_window_id = window_id.clone();
             ds.buffer_hint = buffer_hint;
             ds.recording_started_at = Some(std::time::Instant::now());
 
@@ -1307,6 +1307,7 @@ async fn run_streaming_pipeline(
     // keyboard for every single word delta from the streaming API.
     let wid = window_id.clone();
     let buffer_hint_for_typing = buffer_hint.clone();
+    let window_tracker_for_typing = Arc::clone(&window_tracker);
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
         let mut hint_cleared = buffer_hint_for_typing.is_none();
@@ -1342,10 +1343,10 @@ async fn run_streaming_pipeline(
             // Re-focus the insert target before every batch when the compositor
             // supports it (Hyprland, Sway, etc.). On GNOME/KDE we type at the
             // current cursor — stay in your field while recording.
-            if window_tracker.supports_focus_restore() {
+            if window_tracker_for_typing.supports_focus_restore() {
                 if let Some(wid) = &wid {
                     let wid_clone = wid.clone();
-                    let tracker = Arc::clone(&window_tracker);
+                    let tracker = Arc::clone(&window_tracker_for_typing);
                     if let Err(e) = tracker.focus_window(&wid_clone) {
                         warn!("failed to refocus insert target {wid_clone} before typing: {e}");
                     } else {
@@ -1380,7 +1381,7 @@ async fn run_streaming_pipeline(
                 0
             };
             let wid_for_insert = wid.clone();
-            let tracker_for_insert = Arc::clone(&window_tracker);
+            let tracker_for_insert = Arc::clone(&window_tracker_for_typing);
             match tokio::task::spawn_blocking(move || {
                 insert_at_target(
                     &text_to_type,
@@ -1624,6 +1625,7 @@ async fn run_silence_hint(
         let tracker_clone = Arc::clone(&tracker);
         let window_id = window_id.clone();
         let update = update.to_string();
+        let update_len = update.len();
         match tokio::task::spawn_blocking(move || {
             insert_at_target(
                 &update,
@@ -1636,7 +1638,7 @@ async fn run_silence_hint(
         })
         .await
         {
-            Ok(Ok(())) => hint.set_len(update.len()),
+            Ok(Ok(())) => hint.set_len(update_len),
             Ok(Err(e)) => {
                 warn!("failed to update silence hint: {e:#}");
                 return;
@@ -1675,6 +1677,7 @@ async fn run_buffer_countdown(
         let tracker_clone = Arc::clone(&tracker);
         let window_id = window_id.clone();
         let update = update.to_string();
+        let update_len = update.len();
         match tokio::task::spawn_blocking(move || {
             insert_at_target(
                 &update,
@@ -1687,7 +1690,7 @@ async fn run_buffer_countdown(
         })
         .await
         {
-            Ok(Ok(())) => hint.set_len(update.len()),
+            Ok(Ok(())) => hint.set_len(update_len),
             Ok(Err(e)) => {
                 warn!("failed to update buffer hint: {e:#}");
                 return;
