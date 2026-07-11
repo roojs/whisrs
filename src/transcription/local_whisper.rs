@@ -12,20 +12,23 @@ use std::sync::Arc;
 
 use asr_dedup::TextDedup;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use super::{TranscriptionBackend, TranscriptionConfig};
 use crate::audio::AudioChunk;
 
 /// Sliding window parameters for pseudo-streaming.
-const WINDOW_SECS: usize = 8;
-const STEP_SECS: usize = 2;
+///
+/// Tuned toward whisper.cpp's `whisper-stream` defaults (5 s window, 1 s step)
+/// while keeping a shorter first window for faster time-to-first-token.
+const WINDOW_SECS: usize = 5;
+const STEP_SECS: usize = 1;
 const SAMPLE_RATE: usize = 16_000;
 const WINDOW_SAMPLES: usize = WINDOW_SECS * SAMPLE_RATE;
 const STEP_SAMPLES: usize = STEP_SECS * SAMPLE_RATE;
 /// Shorter initial window for faster first result.
-const INITIAL_WINDOW_SECS: usize = 4;
+const INITIAL_WINDOW_SECS: usize = 2;
 const INITIAL_WINDOW_SAMPLES: usize = INITIAL_WINDOW_SECS * SAMPLE_RATE;
 
 /// Silence threshold — must match or be below the daemon's auto-stop threshold
@@ -76,48 +79,55 @@ fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
-/// Run whisper inference on an audio window.
-///
-/// - `prompt`: previous transcription to condition this window for consistency.
-///   Whisper uses it to maintain context across overlapping windows.
-fn run_whisper_inference(
-    ctx: &whisper_rs::WhisperContext,
-    audio: &[f32],
+fn inference_thread_count() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+        .min(8)
+}
+
+fn configure_full_params(
+    params: &mut whisper_rs::FullParams<'_>,
     language: &str,
     prompt: Option<&str>,
-) -> anyhow::Result<String> {
-    use whisper_rs::{FullParams, SamplingStrategy};
-
-    let mut state = ctx
-        .create_state()
-        .map_err(|e| anyhow::anyhow!("failed to create whisper state: {e}"))?;
-
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-
+    streaming: bool,
+) {
     if language != "auto" {
         params.set_language(Some(language));
     }
 
-    // Feed previous transcription as prompt so whisper produces consistent
-    // output across overlapping windows.
     if let Some(prompt) = prompt {
         if !prompt.is_empty() {
             params.set_initial_prompt(prompt);
         }
     }
-    // Allow whisper to use the prompt as context.
     params.set_no_context(false);
 
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    params.set_n_threads(inference_thread_count());
 
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(4)
-        .min(8);
-    params.set_n_threads(n_threads);
+    if streaming {
+        // Match whisper-stream: one segment per window for lower decode latency.
+        params.set_single_segment(true);
+    }
+}
+
+/// Run whisper inference on an audio window, reusing an existing state when
+/// provided.
+fn run_whisper_inference_on_state(
+    state: &mut whisper_rs::WhisperState,
+    audio: &[f32],
+    language: &str,
+    prompt: Option<&str>,
+    streaming: bool,
+) -> anyhow::Result<String> {
+    use whisper_rs::{FullParams, SamplingStrategy};
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    configure_full_params(&mut params, language, prompt, streaming);
 
     state
         .full(params, audio)
@@ -129,6 +139,123 @@ fn run_whisper_inference(
     }
 
     Ok(text.trim().to_string())
+}
+
+/// Run whisper inference on an audio window.
+///
+/// - `prompt`: previous transcription to condition this window for consistency.
+///   Whisper uses it to maintain context across overlapping windows.
+fn run_whisper_inference(
+    ctx: &whisper_rs::WhisperContext,
+    audio: &[f32],
+    language: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut state = ctx
+        .create_state()
+        .map_err(|e| anyhow::anyhow!("failed to create whisper state: {e}"))?;
+
+    run_whisper_inference_on_state(&mut state, audio, language, prompt, false)
+}
+
+struct StreamInferJob {
+    samples: Vec<f32>,
+    language: String,
+    prompt: Option<String>,
+    result_tx: oneshot::Sender<anyhow::Result<String>>,
+}
+
+/// Dedicated inference thread for a streaming session. Reuses one whisper state
+/// (and its GPU buffers) across all windows instead of reallocating per chunk.
+fn start_stream_infer_thread(
+    ctx: Arc<whisper_rs::WhisperContext>,
+) -> anyhow::Result<std::sync::mpsc::SyncSender<StreamInferJob>> {
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<StreamInferJob>(1);
+
+    std::thread::Builder::new()
+        .name("whisper-stream".into())
+        .spawn(move || {
+            let mut state = match ctx.create_state() {
+                Ok(state) => state,
+                Err(e) => {
+                    let err =
+                        anyhow::anyhow!("failed to create whisper streaming state: {e}");
+                    while let Ok(job) = job_rx.recv() {
+                        let _ = job.result_tx.send(Err(err.clone()));
+                    }
+                    return;
+                }
+            };
+
+            while let Ok(job) = job_rx.recv() {
+                let result = run_whisper_inference_on_state(
+                    &mut state,
+                    &job.samples,
+                    &job.language,
+                    job.prompt.as_deref(),
+                    true,
+                );
+                let _ = job.result_tx.send(result);
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn whisper streaming inference thread: {e}"))?;
+
+    Ok(job_tx)
+}
+
+async fn infer_stream_window(
+    infer_tx: &std::sync::mpsc::SyncSender<StreamInferJob>,
+    samples: Vec<f32>,
+    language: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<String> {
+    let (result_tx, result_rx) = oneshot::channel();
+    infer_tx
+        .send(StreamInferJob {
+            samples,
+            language: language.to_string(),
+            prompt: prompt.map(str::to_string),
+            result_tx,
+        })
+        .map_err(|_| anyhow::anyhow!("whisper streaming inference thread exited"))?;
+
+    result_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("whisper streaming inference result dropped"))?
+}
+
+async fn process_stream_window(
+    infer_tx: &std::sync::mpsc::SyncSender<StreamInferJob>,
+    window: &[i16],
+    language: &str,
+    prompt: &mut String,
+    dedup: &mut TextDedup,
+    text_tx: &mpsc::Sender<String>,
+) {
+    if audio_silence_gate::is_silent(window, SILENCE_THRESHOLD) {
+        return;
+    }
+
+    let samples_f32 = i16_to_f32(window);
+    let prev_prompt = if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt.as_str())
+    };
+
+    match infer_stream_window(infer_tx, samples_f32, language, prev_prompt).await {
+        Ok(full_text) => {
+            if !full_text.is_empty() {
+                prompt.clone_from(&full_text);
+            }
+            let new_text = dedup.filter_text(&full_text);
+            if !new_text.trim().is_empty() {
+                debug!("streaming window produced: {:?}", new_text);
+                text_tx.send(new_text).await.ok();
+            }
+        }
+        Err(e) => warn!("whisper window inference failed: {e}"),
+    }
 }
 
 #[async_trait]
@@ -174,6 +301,8 @@ impl TranscriptionBackend for LocalWhisperBackend {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("whisper model not loaded from {}", self.model_path))?;
 
+        let infer_tx = start_stream_infer_thread(Arc::clone(ctx))?;
+
         let mut buffer: Vec<i16> = Vec::new();
         let mut dedup = TextDedup::new();
         let mut next_process_at = INITIAL_WINDOW_SAMPLES;
@@ -196,47 +325,21 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 let window_start = window_end.saturating_sub(window_size);
                 let window = buffer[window_start..window_end].to_vec();
 
-                // Skip silent windows.
-                if !audio_silence_gate::is_silent(&window, SILENCE_THRESHOLD) {
-                    let samples_f32 = i16_to_f32(&window);
-                    let ctx_clone = Arc::clone(ctx);
-                    let lang = config.language.clone();
-                    let prev_prompt = if prompt.is_empty() {
-                        None
-                    } else {
-                        Some(prompt.clone())
-                    };
-
-                    match tokio::task::spawn_blocking(move || {
-                        run_whisper_inference(
-                            &ctx_clone,
-                            &samples_f32,
-                            &lang,
-                            prev_prompt.as_deref(),
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(full_text)) => {
-                            // Update prompt with this window's full transcription.
-                            if !full_text.is_empty() {
-                                prompt.clone_from(&full_text);
-                            }
-                            // Use text-based dedup to extract only the new portion.
-                            let new_text = dedup.filter_text(&full_text);
-                            if !new_text.trim().is_empty() {
-                                debug!("streaming window produced: {:?}", new_text);
-                                text_tx.send(new_text).await.ok();
-                            }
-                        }
-                        Ok(Err(e)) => warn!("whisper window inference failed: {e}"),
-                        Err(e) => warn!("whisper task panicked: {e}"),
-                    }
-                } else {
+                if audio_silence_gate::is_silent(&window, SILENCE_THRESHOLD) {
                     debug!(
                         "skipping silent window at samples {}..{}",
                         window_start, window_end
                     );
+                } else {
+                    process_stream_window(
+                        &infer_tx,
+                        &window,
+                        &config.language,
+                        &mut prompt,
+                        &mut dedup,
+                        &text_tx,
+                    )
+                    .await;
                 }
 
                 last_processed_end = window_end;
@@ -251,34 +354,17 @@ impl TranscriptionBackend for LocalWhisperBackend {
             } else {
                 last_processed_end
             };
-            let remaining = &buffer[remaining_start..];
+            let remaining = buffer[remaining_start..].to_vec();
 
-            if !remaining.is_empty() && !audio_silence_gate::is_silent(remaining, SILENCE_THRESHOLD)
-            {
-                let samples_f32 = i16_to_f32(remaining);
-                let ctx_clone = Arc::clone(ctx);
-                let lang = config.language.clone();
-                let prev_prompt = if prompt.is_empty() {
-                    None
-                } else {
-                    Some(prompt.clone())
-                };
-
-                match tokio::task::spawn_blocking(move || {
-                    run_whisper_inference(&ctx_clone, &samples_f32, &lang, prev_prompt.as_deref())
-                })
-                .await
-                {
-                    Ok(Ok(full_text)) => {
-                        let new_text = dedup.filter_text(&full_text);
-                        if !new_text.trim().is_empty() {
-                            text_tx.send(new_text).await.ok();
-                        }
-                    }
-                    Ok(Err(e)) => warn!("whisper final inference failed: {e}"),
-                    Err(e) => warn!("whisper final task panicked: {e}"),
-                }
-            }
+            process_stream_window(
+                &infer_tx,
+                &remaining,
+                &config.language,
+                &mut prompt,
+                &mut dedup,
+                &text_tx,
+            )
+            .await;
         }
 
         Ok(())
