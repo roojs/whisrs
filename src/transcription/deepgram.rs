@@ -517,6 +517,7 @@ mod tests {
             language: "en".to_string(),
             model: "nova-3".to_string(),
             prompt: None,
+            ..Default::default()
         };
         let err = backend.transcribe(&[], &config).await.unwrap_err();
         assert!(err.to_string().contains("empty audio"));
@@ -555,6 +556,7 @@ mod tests {
             language: "auto".to_string(),
             model: "nova-3".to_string(),
             prompt: None,
+            ..Default::default()
         };
         let params = build_query_params(&config, &[]);
         assert!(params

@@ -257,6 +257,7 @@ mod tests {
             language: "auto".to_string(),
             model: "   ".to_string(),
             prompt: None,
+            ..Default::default()
         });
 
         assert_eq!(request.model, "Whisper-Tiny");
@@ -295,6 +296,7 @@ mod tests {
             language: "auto".to_string(),
             model: "Whisper-Tiny".to_string(),
             prompt: None,
+            ..Default::default()
         }
     }
 

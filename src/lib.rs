@@ -6,6 +6,7 @@ pub mod history;
 pub mod hotkey;
 pub mod llm;
 pub mod overlay;
+pub mod review;
 pub mod state;
 pub mod transcription;
 pub mod tray;
@@ -279,6 +280,11 @@ pub struct GeneralConfig {
     /// this setting too.
     #[serde(default)]
     pub smart_punctuation: bool,
+    /// Show an editable review dialog after dictation instead of typing live.
+    /// The dialog appears near the insert target; on confirm the final text is
+    /// pasted once. Eliminates streaming overlap/repetition issues.
+    #[serde(default = "default_true")]
+    pub review_before_paste: bool,
 }
 
 impl Default for GeneralConfig {
@@ -297,6 +303,7 @@ impl Default for GeneralConfig {
             tray: true,
             overlay: false,
             smart_punctuation: false,
+            review_before_paste: true,
         }
     }
 }

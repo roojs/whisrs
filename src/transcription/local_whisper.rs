@@ -497,6 +497,7 @@ mod tests {
             language: "en".to_string(),
             model: "base.en".to_string(),
             prompt: None,
+            ..Default::default()
         };
         let err = backend.transcribe(&[1, 2, 3], &config).await.unwrap_err();
         let msg = err.to_string();

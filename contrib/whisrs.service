@@ -5,7 +5,8 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=whisrsd
+# sg grants the input group without requiring a full logout after usermod.
+ExecStart=/usr/bin/sg input -c 'exec whisrsd'
 Restart=on-failure
 RestartSec=3
 

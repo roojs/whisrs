@@ -1126,6 +1126,7 @@ mod stream_lifecycle_tests {
             language: "en".to_string(),
             model: "gpt-4o-mini-transcribe".to_string(),
             prompt: None,
+            ..Default::default()
         }
     }
 

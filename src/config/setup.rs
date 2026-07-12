@@ -152,6 +152,7 @@ pub fn run_setup() -> Result<()> {
             tray: true,
             overlay,
             smart_punctuation: false,
+            review_before_paste: true,
         },
         audio: AudioConfig {
             device: "default".to_string(),

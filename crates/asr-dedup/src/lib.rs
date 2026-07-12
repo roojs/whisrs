@@ -705,6 +705,17 @@ mod tests {
     }
 
     #[test]
+    fn dedup_window_text_user_repeat_case() {
+        let committed = "This is a test to see if two talking works";
+        let window = "This is a test to see if talking works";
+        assert_eq!(
+            dedup_window_text(committed, window),
+            "talking works",
+            "should strip repeated prefix, not re-type full phrase"
+        );
+    }
+
+    #[test]
     fn dedup_window_text_sliding_window() {
         let mut committed = String::new();
         for (window, expected) in [

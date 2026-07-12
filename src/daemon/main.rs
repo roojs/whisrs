@@ -916,7 +916,8 @@ async fn handle_toggle(
 
             let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
             let injector_backend = context.config.input.backend;
-            let show_buffer_hint = context.config.input.buffer_countdown_for_backend(
+            let show_buffer_hint = !context.config.general.review_before_paste
+                && context.config.input.buffer_countdown_for_backend(
                 &context.config.general.backend,
             ) && context.transcription_backend.supports_streaming()
                 && window_id.is_some();
@@ -1056,6 +1057,7 @@ async fn handle_toggle(
                 let pipeline_key_delay = key_delay;
                 let pipeline_injector_backend = injector_backend;
                 let pipeline_smart_punctuation = context.config.general.smart_punctuation;
+                let pipeline_review = context.config.general.review_before_paste;
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -1079,6 +1081,7 @@ async fn handle_toggle(
                         pipeline_injector_backend,
                         buffer_hint_for_pipeline,
                         pipeline_smart_punctuation,
+                        pipeline_review,
                     )
                     .await
                 });
@@ -1139,6 +1142,7 @@ async fn handle_toggle(
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
                     let recording_started_at = ds.recording_started_at.take();
+                    let was_streaming = streaming_task.is_some();
 
                     // Release lock before slow operations.
                     drop(ds);
@@ -1182,9 +1186,30 @@ async fn handle_toggle(
                                 let _ = level_tx.send(0.0);
                             }
                             match result {
-                                Ok(text) => {
+                                Ok(mut text) => {
+                                    if !was_streaming
+                                        && context.config.general.review_before_paste
+                                        && !text.is_empty()
+                                    {
+                                        let key_delay = std::time::Duration::from_millis(
+                                            context.config.input.key_delay_ms,
+                                        );
+                                        match review_and_commit_transcription(
+                                            &text,
+                                            window_id.as_deref(),
+                                            &context.window_tracker,
+                                            key_delay,
+                                            context.config.input.backend,
+                                        )
+                                        .await
+                                        {
+                                            Ok(reviewed) => text = reviewed,
+                                            Err(e) => warn!("review dialog failed: {e:#}"),
+                                        }
+                                    }
+
                                     info!("transcription complete: {} chars", text.len());
-                                    if !text.is_empty() {
+                                    if !was_streaming && !text.is_empty() {
                                         save_history_entry(
                                             &text,
                                             &context.config.general.backend,
@@ -1281,6 +1306,7 @@ async fn run_streaming_pipeline(
     injector_backend: InjectorBackend,
     buffer_hint: Option<Arc<BufferHint>>,
     smart_punctuation: bool,
+    review_before_paste: bool,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -1314,6 +1340,7 @@ async fn run_streaming_pipeline(
     let wid = window_id.clone();
     let buffer_hint_for_typing = buffer_hint.clone();
     let window_tracker_for_typing = Arc::clone(&window_tracker);
+    let review_mode = review_before_paste;
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
         let mut hint_cleared = buffer_hint_for_typing.is_none();
@@ -1365,7 +1392,7 @@ async fn run_streaming_pipeline(
             // Re-focus the insert target before every batch when the compositor
             // supports it (Hyprland, Sway, etc.). On GNOME/KDE we type at the
             // current cursor — stay in your field while recording.
-            if window_tracker_for_typing.supports_focus_restore() {
+            if !review_mode && window_tracker_for_typing.supports_focus_restore() {
                 if let Some(wid) = &wid {
                     let wid_clone = wid.clone();
                     let tracker = Arc::clone(&window_tracker_for_typing);
@@ -1391,6 +1418,11 @@ async fn run_streaming_pipeline(
             };
 
             full_text.push_str(&text_to_type);
+
+            if review_mode {
+                info!("review mode: buffered {:?}", text_to_type);
+                continue;
+            }
 
             info!("typing: {:?}", text_to_type);
             let replace_hint_len = if !hint_cleared {
@@ -1581,6 +1613,27 @@ async fn run_streaming_pipeline(
         }
     }
 
+    // Review dialog + single paste (streaming review mode).
+    let full_text = if review_before_paste && !full_text.is_empty() {
+        match review_and_commit_transcription(
+            &full_text,
+            window_id.as_deref(),
+            &window_tracker,
+            key_delay,
+            injector_backend,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                warn!("review dialog failed: {e:#}");
+                full_text
+            }
+        }
+    } else {
+        full_text
+    };
+
     // Save to history if we got any text.
     if !full_text.is_empty() {
         let duration_secs = pipeline_start.elapsed().as_secs_f64();
@@ -1739,6 +1792,49 @@ fn clear_buffer_hint_at_target(
     if let Err(e) = insert_at_target("", window_id, tracker.as_ref(), len, key_delay, backend) {
         warn!("failed to clear buffer hint: {e:#}");
     }
+}
+
+/// Show the review dialog and paste the user's edited text in one shot.
+async fn review_and_commit_transcription(
+    text: &str,
+    window_id: Option<&str>,
+    window_tracker: &Arc<dyn WindowTracker>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) -> Result<String> {
+    let draft = text.to_string();
+    let reviewed = tokio::task::spawn_blocking(move || whisrs::review::show_review_dialog(&draft))
+        .await
+        .context("review dialog task failed")??;
+
+    let Some(reviewed) = reviewed else {
+        info!("review dialog dismissed — nothing pasted");
+        return Ok(String::new());
+    };
+
+    if reviewed.trim().is_empty() {
+        info!("review dialog returned empty text — nothing pasted");
+        return Ok(String::new());
+    }
+
+    let reviewed_clone = reviewed.clone();
+    let wid = window_id.map(str::to_string);
+    let tracker = Arc::clone(window_tracker);
+    tokio::task::spawn_blocking(move || {
+        insert_at_target(
+            &reviewed_clone,
+            wid.as_deref(),
+            tracker.as_ref(),
+            0,
+            key_delay,
+            injector_backend,
+        )
+    })
+    .await
+    .context("review paste task failed")??;
+
+    info!("pasted reviewed transcription ({} chars)", reviewed.len());
+    Ok(reviewed)
 }
 
 /// Focus the insert target, select any provisional hint text, then replace it.
@@ -1921,6 +2017,10 @@ async fn process_recording_batch(
 
     if text.is_empty() {
         info!("transcription returned empty text — nothing to type");
+        return Ok(text);
+    }
+
+    if context.config.general.review_before_paste {
         return Ok(text);
     }
 
