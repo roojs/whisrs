@@ -11,7 +11,7 @@ use asr_dedup::dedup_window_text;
 use audio_silence_gate::{audio_gate_reason, AutoStopDetector, SILENCE_RMS_THRESHOLD};
 use filler_remove::FillerFilter;
 use prompt_echo::is_prompt_echo;
-use whisrs::audio::capture::{AudioCaptureHandle, SAMPLE_RATE};
+use whisrs::audio::capture::{encode_wav, AudioCaptureHandle, SAMPLE_RATE};
 use whisrs::audio::feedback;
 use whisrs::history::{self, HistoryEntry};
 use whisrs::llm;
@@ -1350,6 +1350,7 @@ async fn run_streaming_pipeline(
 
     // Spawn the transcription backend.
     let config_clone = config.clone();
+    let backend_for_final = Arc::clone(&backend);
     let backend_task = tokio::spawn(async move {
         backend
             .transcribe_stream(backend_rx, text_tx, &config_clone)
@@ -1399,10 +1400,14 @@ async fn run_streaming_pipeline(
             // Drop overlap with text already typed this session. Streaming
             // backends (Deepgram, Groq chunks, server VAD) emit a fresh final
             // after each pause; without this, the last word is often repeated.
-            batch = dedup_window_text(&full_text, &batch);
-            if batch.trim().is_empty() {
-                debug!("skipping duplicate streaming batch after dedup");
-                continue;
+            // In review/overlay mode we show a live preview and transcribe the
+            // full recording once at the end — skip dedup here.
+            if !review_mode {
+                batch = dedup_window_text(&full_text, &batch);
+                if batch.trim().is_empty() {
+                    debug!("skipping duplicate streaming batch after dedup");
+                    continue;
+                }
             }
 
             if !smart_punctuation {
@@ -1430,7 +1435,10 @@ async fn run_streaming_pipeline(
             // Add space separator between turns if needed.
             // Don't insert a space before punctuation streaming deltas,
             // as they arrive as bare tokens.
-            let text_to_type = if full_text.is_empty()
+            let text_to_type = if review_mode {
+                // Live overlay preview: show the latest chunk/window as-is.
+                batch.clone()
+            } else if full_text.is_empty()
                 || batch.starts_with(' ')
                 || full_text.ends_with(' ')
                 || leads_with_punct(&batch)
@@ -1440,15 +1448,16 @@ async fn run_streaming_pipeline(
                 format!(" {batch}")
             };
 
-            full_text.push_str(&text_to_type);
-
             if review_mode {
+                full_text = text_to_type.clone();
                 if let Some(tx) = &overlay_text {
                     let _ = tx.send(full_text.clone());
                 }
-                info!("review mode: buffered {:?}", text_to_type);
+                info!("review preview: {:?}", text_to_type);
                 continue;
             }
+
+            full_text.push_str(&text_to_type);
 
             info!("typing: {:?}", text_to_type);
             let replace_hint_len = if !hint_cleared {
@@ -1487,8 +1496,13 @@ async fn run_streaming_pipeline(
     let mut auto_stop =
         AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
     let mut buffering_countdown_started = false;
+    let mut recording_audio = Vec::new();
+    let tee_audio = review_before_paste;
 
     while let Some(chunk) = audio_rx.recv().await {
+        if tee_audio {
+            recording_audio.extend_from_slice(&chunk);
+        }
         let had_speech = auto_stop.has_speech();
 
         if let (Some(hint), Some(wid)) = (&buffer_hint, &window_id) {
@@ -1569,6 +1583,9 @@ async fn run_streaming_pipeline(
 
     // Drain remaining audio from the capture channel into the backend.
     while let Some(chunk) = audio_rx.recv().await {
+        if tee_audio {
+            recording_audio.extend_from_slice(&chunk);
+        }
         if audio_tx.send(chunk).await.is_err() {
             break;
         }
@@ -1624,8 +1641,37 @@ async fn run_streaming_pipeline(
         }
     };
 
-    // Notify user about streaming errors. Errors always pop, even with the
-    // overlay on — the overlay can't carry the failure detail.
+    // Review mode: one accurate full-audio pass for paste; streaming output was
+    // only a live overlay preview.
+    let full_text = if review_before_paste && !recording_audio.is_empty() {
+        match encode_wav(&recording_audio) {
+            Ok(wav) => match backend_for_final.transcribe(&wav, &config).await {
+                Ok(final_text) if !final_text.trim().is_empty() => {
+                    info!(
+                        "final review transcription: {} chars (replacing live preview)",
+                        final_text.len()
+                    );
+                    if let Some(tx) = &overlay_text_tx {
+                        let _ = tx.send(final_text.clone());
+                    }
+                    final_text
+                }
+                Ok(_) => full_text,
+                Err(e) => {
+                    warn!("final review transcription failed: {e:#} — using live preview");
+                    full_text
+                }
+            },
+            Err(e) => {
+                warn!("failed to encode recording for final transcription: {e:#}");
+                full_text
+            }
+        }
+    } else {
+        full_text
+    };
+
+    // Notify user about streaming errors.
     if let Some(err_msg) = &stream_error {
         if notify_error {
             if full_text.is_empty() {
@@ -1633,15 +1679,15 @@ async fn run_streaming_pipeline(
             } else {
                 send_notification(
                     "whisrs",
-                    &format!("Transcription failed — partial text may have been typed.\n{err_msg}"),
+                    &format!("Transcription failed — partial preview may be shown.\n{err_msg}"),
                 );
             }
         }
     }
 
     // Review + paste when enabled. With overlay on, text was already shown
-    // in the growing panel — paste directly instead of opening zenity.
-    let full_text = if review_before_paste && !full_text.is_empty() {
+    // in the panel — paste the final transcript directly.
+    let full_text = if review_before_paste && !full_text.trim().is_empty() {
         if overlay_enabled {
             match commit_transcription(
                 &full_text,
@@ -2301,6 +2347,7 @@ fn build_transcription_config(config: &Config) -> TranscriptionConfig {
         model: get_model_for_backend(config),
         prompt: transcription_prompt(config.general.prompt.as_deref(), &config.general.vocabulary),
         smart_punctuation: config.general.smart_punctuation,
+        review_before_paste: config.general.review_before_paste,
     }
 }
 
@@ -2616,6 +2663,7 @@ async fn command_mode_background(
         model: get_model_for_backend(&context.config),
         prompt: None,
         smart_punctuation: context.config.general.smart_punctuation,
+        review_before_paste: context.config.general.review_before_paste,
     };
 
     let instruction = match context

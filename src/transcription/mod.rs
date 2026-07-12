@@ -48,6 +48,9 @@ pub struct TranscriptionConfig {
     pub prompt: Option<String>,
     /// When true, keep ASR smart punctuation (e.g. Deepgram smart_format).
     pub smart_punctuation: bool,
+    /// Overlay review mode: stream live preview only; defer accurate paste to a
+    /// final full-audio transcription instead of deduped live typing.
+    pub review_before_paste: bool,
 }
 
 impl Default for TranscriptionConfig {
@@ -57,6 +60,7 @@ impl Default for TranscriptionConfig {
             model: String::new(),
             prompt: None,
             smart_punctuation: false,
+            review_before_paste: false,
         }
     }
 }

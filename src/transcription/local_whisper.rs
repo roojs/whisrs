@@ -2,12 +2,9 @@
 //!
 //! Uses whisper-rs with a sliding window approach for pseudo-streaming.
 //!
-//! Deduplication strategy: each window is transcribed with a short
-//! `initial_prompt` tail for consistency. [`asr_dedup::dedup_window_text`]
-//! strips overlap against the committed transcript (including prompt echo after
-//! silence gaps). Timestamp filtering is not used because whisper often
-//! produces a single segment with `start_timestamp=0`, making timestamp-based
-//! approaches unreliable.
+//! Live typing mode: each window is deduplicated against committed text and
+//! only novel suffixes are emitted. Review/overlay mode: windows are sent as
+//! live preview only; the daemon runs one full-audio transcription for paste.
 
 use std::sync::Arc;
 
@@ -311,13 +308,14 @@ async fn process_stream_window(
     committed: &mut String,
     text_tx: &mpsc::Sender<String>,
     omit_initial_prompt: bool,
+    review_before_paste: bool,
 ) {
     if audio_silence_gate::is_silent(window, INFERENCE_SILENCE_THRESHOLD) {
         return;
     }
 
     let samples_f32 = i16_to_f32(window);
-    let prev_prompt = if omit_initial_prompt || committed.is_empty() {
+    let prev_prompt = if review_before_paste || omit_initial_prompt || committed.is_empty() {
         None
     } else {
         let tail = prompt_tail(committed, PROMPT_TAIL_WORDS);
@@ -337,7 +335,16 @@ async fn process_stream_window(
     .await
     {
         Ok(full_text) => {
-            let new_text = dedup_window_text(committed, &full_text);
+            let trimmed = full_text.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if review_before_paste {
+                debug!("review preview window: {:?}", trimmed);
+                text_tx.send(trimmed.to_string()).await.ok();
+                return;
+            }
+            let new_text = dedup_window_text(committed, trimmed);
             if new_text.trim().is_empty() {
                 return;
             }
@@ -404,6 +411,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
         // Committed transcript fed back as initial_prompt tail for the next window.
         let mut committed = config.prompt.clone().unwrap_or_default();
         let mut speech_started = false;
+        let review_before_paste = config.review_before_paste;
 
         while let Some(chunk) = audio_rx.recv().await {
             if !speech_started && !audio_silence_gate::is_silent(&chunk, audio_silence_gate::SILENCE_RMS_THRESHOLD) {
@@ -449,6 +457,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
                         &mut committed,
                         &text_tx,
                         omit_prompt,
+                        review_before_paste,
                     )
                     .await;
                 }
@@ -474,6 +483,7 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 &mut committed,
                 &text_tx,
                 false,
+                review_before_paste,
             )
             .await;
         }
