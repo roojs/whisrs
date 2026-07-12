@@ -246,14 +246,17 @@ fn filter_whisper_segment(text: &str, no_speech_prob: f32) -> Option<String> {
 
 fn collect_whisper_text(state: &whisper_rs::WhisperState) -> String {
     let mut text = String::new();
-    for segment in state.as_iter() {
-        let raw = segment.to_str_lossy().unwrap_or_default();
-        match filter_whisper_segment(&raw, segment.no_speech_probability()) {
+    let Ok(n_segments) = state.full_n_segments() else {
+        return String::new();
+    };
+    for i in 0..n_segments {
+        let raw = state.full_get_segment_text_lossy(i).unwrap_or_default();
+        // whisper-rs 0.14 does not expose per-segment no_speech probability.
+        match filter_whisper_segment(&raw, 0.0) {
             Some(part) => text.push_str(&part),
             None if !raw.trim().is_empty() => {
                 debug!(
-                    "filtered whisper segment (no_speech={:.2}): {:?}",
-                    segment.no_speech_probability(),
+                    "filtered whisper segment: {:?}",
                     raw
                 );
             }

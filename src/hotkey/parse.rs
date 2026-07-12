@@ -85,7 +85,7 @@ fn format_hotkey_part(part: &str) -> String {
         "f11" => "F11".to_string(),
         "f12" => "F12".to_string(),
         other if other.len() == 1 => other.to_uppercase(),
-        other => part.to_string(),
+        _ => part.to_string(),
     }
 }
 

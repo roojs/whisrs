@@ -1899,7 +1899,7 @@ async fn process_recording_batch(
     }
 
     // Apply filler word removal if enabled.
-    let text = if context.config.general.remove_filler_words {
+    let mut text = if context.config.general.remove_filler_words {
         let filter = FillerFilter::new(&context.config.general.filler_words)
             .context("invalid custom filler word in configuration")?;
         let cleaned = filter.apply(&text);
@@ -2436,6 +2436,7 @@ async fn command_mode_background(
         language: context.config.general.language.clone(),
         model: get_model_for_backend(&context.config),
         prompt: None,
+        smart_punctuation: context.config.general.smart_punctuation,
     };
 
     let instruction = match context

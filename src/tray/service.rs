@@ -160,9 +160,9 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let mut items = vec![Self::info_menu_item(Self::status_text(
-            self.state.current,
-        ))];
+        let mut items = vec![Self::info_menu_item(
+            Self::status_text(self.state.current).to_string(),
+        )];
 
         if let Some(hotkeys) = &self.state.hotkeys {
             if let Some(toggle) = hotkeys.toggle.as_deref() {

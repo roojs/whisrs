@@ -71,7 +71,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x11rb = { version = "0.13", features = ["randr", "shape"] }
-zbus = "5"
+zbus = "5.12"
 
 [dependencies.ksni]
 version = "0.3"
@@ -92,7 +92,7 @@ default-features = false
 features = ["std", "simd"]
 
 [dependencies.whisper-rs]
-version = "0.16"
+version = "0.14"
 optional = true
 
 [dev-dependencies]
