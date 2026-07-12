@@ -29,6 +29,16 @@
   max-height: 28px;
 }
 
+.whisrs-overlay-text {
+  color: #f0edf5;
+  font-size: 13px;
+  line-height: 17px;
+  padding: 12px;
+  background-color: rgba(14, 14, 16, 0.92);
+  border-radius: 10px;
+  border: 1px solid rgba(58, 58, 64, 0.5);
+}
+
 /* Ember (default) — amber recording, soft white transcribing. */
 .whisrs-theme-ember {
   border: 1px solid rgba(249, 115, 22, 0.25);

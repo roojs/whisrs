@@ -142,6 +142,8 @@ struct DaemonContext {
     state_tx: tokio::sync::watch::Sender<State>,
     /// Normalized microphone level for speech-reactive overlays.
     overlay_level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    /// Live transcript text shown in the overlay when review-before-paste is on.
+    overlay_text_tx: Option<tokio::sync::watch::Sender<String>>,
     /// `true` when the visual overlay is enabled. State-transition toasts
     /// are suppressed in that case to avoid duplicate signaling — the
     /// overlay already shows recording/transcribing state visually.
@@ -746,6 +748,7 @@ async fn main() -> Result<()> {
     // State broadcast channel — consumed by system tray and overlay.
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
     let (overlay_level_tx, overlay_level_rx) = tokio::sync::watch::channel(0.0_f32);
+    let (overlay_text_tx, overlay_text_rx) = tokio::sync::watch::channel(String::new());
 
     let tray_enabled = config.general.tray;
     let overlay_enabled = config.general.overlay;
@@ -757,6 +760,7 @@ async fn main() -> Result<()> {
         notify,
         state_tx,
         overlay_level_tx: overlay_enabled.then_some(overlay_level_tx),
+        overlay_text_tx: overlay_enabled.then_some(overlay_text_tx),
         overlay_enabled,
     });
 
@@ -773,6 +777,7 @@ async fn main() -> Result<()> {
         tokio::spawn(whisrs::overlay::spawn_overlay(
             state_rx,
             overlay_level_rx,
+            overlay_text_rx,
             overlay_config,
         ));
     }
@@ -1058,6 +1063,7 @@ async fn handle_toggle(
                 let pipeline_injector_backend = injector_backend;
                 let pipeline_smart_punctuation = context.config.general.smart_punctuation;
                 let pipeline_review = context.config.general.review_before_paste;
+                let pipeline_overlay_text_tx = context.overlay_text_tx.clone();
 
                 let task = tokio::spawn(async move {
                     run_streaming_pipeline(
@@ -1082,6 +1088,7 @@ async fn handle_toggle(
                         buffer_hint_for_pipeline,
                         pipeline_smart_punctuation,
                         pipeline_review,
+                        pipeline_overlay_text_tx,
                     )
                     .await
                 });
@@ -1194,18 +1201,32 @@ async fn handle_toggle(
                                         let key_delay = std::time::Duration::from_millis(
                                             context.config.input.key_delay_ms,
                                         );
-                                        match review_and_commit_transcription(
-                                            &text,
-                                            window_id.as_deref(),
-                                            &context.window_tracker,
-                                            key_delay,
-                                            context.config.input.backend,
-                                        )
-                                        .await
-                                        {
+                                        match if context.overlay_enabled {
+                                            commit_transcription(
+                                                &text,
+                                                window_id.as_deref(),
+                                                &context.window_tracker,
+                                                key_delay,
+                                                context.config.input.backend,
+                                            )
+                                            .await
+                                        } else {
+                                            review_and_commit_transcription(
+                                                &text,
+                                                window_id.as_deref(),
+                                                &context.window_tracker,
+                                                key_delay,
+                                                context.config.input.backend,
+                                            )
+                                            .await
+                                        } {
                                             Ok(reviewed) => text = reviewed,
-                                            Err(e) => warn!("review dialog failed: {e:#}"),
+                                            Err(e) => warn!("review/paste failed: {e:#}"),
                                         }
+                                    }
+
+                                    if let Some(tx) = &context.overlay_text_tx {
+                                        let _ = tx.send(String::new());
                                     }
 
                                     info!("transcription complete: {} chars", text.len());
@@ -1307,6 +1328,7 @@ async fn run_streaming_pipeline(
     buffer_hint: Option<Arc<BufferHint>>,
     smart_punctuation: bool,
     review_before_paste: bool,
+    overlay_text_tx: Option<tokio::sync::watch::Sender<String>>,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
@@ -1341,6 +1363,7 @@ async fn run_streaming_pipeline(
     let buffer_hint_for_typing = buffer_hint.clone();
     let window_tracker_for_typing = Arc::clone(&window_tracker);
     let review_mode = review_before_paste;
+    let overlay_text = overlay_text_tx.clone();
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
         let mut hint_cleared = buffer_hint_for_typing.is_none();
@@ -1420,6 +1443,9 @@ async fn run_streaming_pipeline(
             full_text.push_str(&text_to_type);
 
             if review_mode {
+                if let Some(tx) = &overlay_text {
+                    let _ = tx.send(full_text.clone());
+                }
                 info!("review mode: buffered {:?}", text_to_type);
                 continue;
             }
@@ -1613,26 +1639,49 @@ async fn run_streaming_pipeline(
         }
     }
 
-    // Review dialog + single paste (streaming review mode).
+    // Review + paste when enabled. With overlay on, text was already shown
+    // in the growing panel — paste directly instead of opening zenity.
     let full_text = if review_before_paste && !full_text.is_empty() {
-        match review_and_commit_transcription(
-            &full_text,
-            window_id.as_deref(),
-            &window_tracker,
-            key_delay,
-            injector_backend,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(e) => {
-                warn!("review dialog failed: {e:#}");
-                full_text
+        if overlay_enabled {
+            match commit_transcription(
+                &full_text,
+                window_id.as_deref(),
+                &window_tracker,
+                key_delay,
+                injector_backend,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!("failed to paste reviewed transcription: {e:#}");
+                    full_text
+                }
+            }
+        } else {
+            match review_and_commit_transcription(
+                &full_text,
+                window_id.as_deref(),
+                &window_tracker,
+                key_delay,
+                injector_backend,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!("review dialog failed: {e:#}");
+                    full_text
+                }
             }
         }
     } else {
         full_text
     };
+
+    if let Some(tx) = &overlay_text_tx {
+        let _ = tx.send(String::new());
+    }
 
     // Save to history if we got any text.
     if !full_text.is_empty() {
@@ -1792,6 +1841,36 @@ fn clear_buffer_hint_at_target(
     if let Err(e) = insert_at_target("", window_id, tracker.as_ref(), len, key_delay, backend) {
         warn!("failed to clear buffer hint: {e:#}");
     }
+}
+
+/// Paste transcription text at the insert target in one shot.
+async fn commit_transcription(
+    text: &str,
+    window_id: Option<&str>,
+    window_tracker: &Arc<dyn WindowTracker>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+) -> Result<String> {
+    if text.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let text = text.to_string();
+    let paste = text.clone();
+    let wid = window_id.map(str::to_string);
+    let tracker = Arc::clone(window_tracker);
+    tokio::task::spawn_blocking(move || {
+        insert_at_target(
+            &paste,
+            wid.as_deref(),
+            tracker.as_ref(),
+            0,
+            key_delay,
+            injector_backend,
+        )
+    })
+    .await
+    .context("paste task failed")??;
+    Ok(text)
 }
 
 /// Show the review dialog and paste the user's edited text in one shot.

@@ -11,9 +11,15 @@ const DBUS_PATH = '/org/whisrs/Overlay';
 const STATE_SIGNAL = 'StateChanged';
 const LEVEL_SIGNAL = 'LevelChanged';
 const THEME_SIGNAL = 'ThemeChanged';
+const TEXT_SIGNAL = 'TextChanged';
 
 const OVERLAY_WIDTH = 100;
 const OVERLAY_HEIGHT = 40;
+const TEXT_PANEL_WIDTH = 380;
+const TEXT_LINE_HEIGHT = 17;
+const TEXT_PADDING = 12;
+const TEXT_GAP = 8;
+const TEXT_MAX_LINES = 6;
 const BOTTOM_MARGIN = 16;
 const BAR_COUNT = 7;
 const BAR_W = 3;
@@ -21,9 +27,6 @@ const BAR_GAP = 2;
 const BAR_BASELINE = 6;
 const BAR_VPAD = 6;
 
-// Spawn animation: pill height morphs from a 4-px sliver to its full
-// height, anchored to the bottom of its placement. Slight overshoot via
-// EASE_OUT_BACK for a "physical arrival" pop.
 const SPAWN_IN_MS = 220;
 const SPAWN_OUT_MS = 140;
 const SPAWN_PILL_MIN_H = 4;
@@ -35,6 +38,18 @@ const KNOWN_THEMES = ['ember', 'carbon', 'cyan'];
 export default class WhisrsOverlayExtension extends Extension {
     enable() {
         this._theme = 'carbon';
+        this._transcript = '';
+
+        this._textBox = new St.Label({
+            style_class: 'whisrs-overlay-text',
+            text: '',
+            x_align: Clutter.ActorAlign.FILL,
+            y_align: Clutter.ActorAlign.END,
+        });
+        this._textBox.clutter_text.set({
+            line_wrap: true,
+        });
+        this._textBox.hide();
 
         this._actor = new St.Widget({
             style_class: 'whisrs-overlay whisrs-overlay-hidden whisrs-theme-carbon',
@@ -58,6 +73,7 @@ export default class WhisrsOverlayExtension extends Extension {
             this._barsBox.add_child(bar);
         }
 
+        this._actor.add_child(this._textBox);
         this._actor.add_child(this._barsBox);
         Main.uiGroup.add_child(this._actor);
 
@@ -90,6 +106,14 @@ export default class WhisrsOverlayExtension extends Extension {
                 this._setTheme(theme);
             }
         );
+        this._textSignalId = Gio.DBus.session.signal_subscribe(
+            null, DBUS_INTERFACE, TEXT_SIGNAL, DBUS_PATH, null,
+            Gio.DBusSignalFlags.NONE,
+            (_c, _s, _p, _i, _sig, parameters) => {
+                const [text] = parameters.deep_unpack();
+                this._setText(String(text ?? ''));
+            }
+        );
 
         this._state = 'idle';
         this._level = 0;
@@ -104,12 +128,18 @@ export default class WhisrsOverlayExtension extends Extension {
     disable() {
         this._stopAnimation();
 
-        for (const id of [this._signalId, this._levelSignalId, this._themeSignalId]) {
+        for (const id of [
+            this._signalId,
+            this._levelSignalId,
+            this._themeSignalId,
+            this._textSignalId,
+        ]) {
             if (id) Gio.DBus.session.signal_unsubscribe(id);
         }
         this._signalId = 0;
         this._levelSignalId = 0;
         this._themeSignalId = 0;
+        this._textSignalId = 0;
 
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
@@ -120,6 +150,7 @@ export default class WhisrsOverlayExtension extends Extension {
         this._actor = null;
         this._bars = [];
         this._barsBox = null;
+        this._textBox = null;
     }
 
     _setTheme(theme) {
@@ -129,6 +160,47 @@ export default class WhisrsOverlayExtension extends Extension {
         this._actor.remove_style_class_name(`whisrs-theme-${this._theme}`);
         this._actor.add_style_class_name(`whisrs-theme-${next}`);
         this._theme = next;
+    }
+
+    _wrapTranscript(text) {
+        const words = String(text).trim().split(/\s+/).filter(Boolean);
+        if (words.length === 0) return '';
+
+        const lines = [];
+        let current = '';
+        const maxChars = 52;
+        for (const word of words) {
+            const candidate = current ? `${current} ${word}` : word;
+            if (candidate.length <= maxChars || !current) {
+                current = candidate;
+            } else {
+                lines.push(current);
+                current = word;
+            }
+        }
+        if (current) lines.push(current);
+        return lines.slice(-TEXT_MAX_LINES).join('\n');
+    }
+
+    _setText(text) {
+        this._transcript = String(text ?? '');
+        if (!this._textBox) return;
+
+        const wrapped = this._wrapTranscript(this._transcript);
+        this._textBox.text = wrapped;
+        if (wrapped) {
+            this._textBox.show();
+        } else {
+            this._textBox.hide();
+        }
+        this._position();
+    }
+
+    _textPanelHeight() {
+        if (!this._transcript.trim()) return 0;
+        const lines = this._wrapTranscript(this._transcript).split('\n').filter(Boolean);
+        if (lines.length === 0) return 0;
+        return TEXT_PADDING * 2 + lines.length * TEXT_LINE_HEIGHT;
     }
 
     _setState(state) {
@@ -159,6 +231,7 @@ export default class WhisrsOverlayExtension extends Extension {
             this._actor.add_style_class_name('whisrs-overlay-hidden');
             if (!wasIdle) this._spawnOut();
             this._stopAnimation();
+            this._setText('');
         }
 
         if (!wasIdle && !nowIdle) {
@@ -166,21 +239,15 @@ export default class WhisrsOverlayExtension extends Extension {
         }
     }
 
-    /// Pill "draws out" from a thin line at the bottom edge, growing to
-    /// full height with EASE_OUT_BACK overshoot. Bars stay invisible
-    /// during the grow, then fade in once the pill is mostly settled.
     _spawnIn() {
         if (!this._actor) return;
 
-        // Snap to the start state.
         this._actor.set_easing_duration(0);
-        this._actor.set_pivot_point(0.5, 1.0); // bottom-center
+        this._actor.set_pivot_point(0.5, 1.0);
         this._actor.set_scale(1.0, SPAWN_PILL_MIN_H / OVERLAY_HEIGHT);
         this._actor.opacity = 0;
         if (this._barsBox) this._barsBox.opacity = 0;
 
-        // Then animate to full size — Clutter's EASE_OUT_BACK gives the
-        // small overshoot that makes the arrival feel physical.
         this._actor.set_easing_mode(Clutter.AnimationMode.EASE_OUT_BACK);
         this._actor.set_easing_duration(SPAWN_IN_MS);
         this._actor.set_scale(1.0, 1.0);
@@ -189,7 +256,6 @@ export default class WhisrsOverlayExtension extends Extension {
         this._actor.set_easing_duration(Math.round(SPAWN_IN_MS * 0.64));
         this._actor.opacity = 255;
 
-        // Bars: grace, then a quick fade-in once the pill is mostly grown.
         this._barsGraceUntil = Date.now() + BARS_GRACE_MS + BARS_FADE_MS;
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, BARS_GRACE_MS, () => {
             if (this._barsBox && this._state !== 'idle') {
@@ -201,8 +267,6 @@ export default class WhisrsOverlayExtension extends Extension {
         });
     }
 
-    /// Reverse: collapse height back to a sliver while fading out, then
-    /// hide. EASE_IN_CUBIC for a sharp accelerated dismiss.
     _spawnOut() {
         if (!this._actor) return;
 
@@ -227,15 +291,26 @@ export default class WhisrsOverlayExtension extends Extension {
         if (!this._actor) return;
 
         const monitor = Main.layoutManager.primaryMonitor;
-        const x = Math.floor(monitor.x + (monitor.width - OVERLAY_WIDTH) / 2);
-        const y = Math.floor(monitor.y + monitor.height - OVERLAY_HEIGHT - BOTTOM_MARGIN);
-        this._actor.set_position(Math.max(monitor.x, x), Math.max(monitor.y, y));
-        this._actor.set_size(OVERLAY_WIDTH, OVERLAY_HEIGHT);
+        const textH = this._textPanelHeight();
+        const totalW = Math.max(OVERLAY_WIDTH, textH > 0 ? TEXT_PANEL_WIDTH : OVERLAY_WIDTH);
+        const totalH = OVERLAY_HEIGHT + (textH > 0 ? textH + TEXT_GAP : 0);
+        const x = Math.floor(monitor.x + (monitor.width - totalW) / 2);
+        const y = Math.floor(monitor.y + monitor.height - totalH - BOTTOM_MARGIN);
 
-        const cy = Math.floor(OVERLAY_HEIGHT / 2);
+        this._actor.set_position(Math.max(monitor.x, x), Math.max(monitor.y, y));
+        this._actor.set_size(totalW, totalH);
+
+        const pillY = textH > 0 ? textH + TEXT_GAP : 0;
+        const cy = Math.floor(pillY + OVERLAY_HEIGHT / 2);
         const barBlock = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP;
-        const barsX = Math.floor((OVERLAY_WIDTH - barBlock) / 2);
+        const barsX = Math.floor((totalW - barBlock) / 2);
         const maxH = OVERLAY_HEIGHT - BAR_VPAD * 2;
+
+        if (this._textBox) {
+            this._textBox.set_position(0, 0);
+            this._textBox.set_size(totalW, textH || 0);
+        }
+
         if (this._barsBox) {
             this._barsBox.set_position(barsX, cy - Math.floor(maxH / 2));
             this._barsBox.set_size(barBlock, maxH);
@@ -245,11 +320,6 @@ export default class WhisrsOverlayExtension extends Extension {
     _startAnimation() {
         if (this._animationId) return;
 
-        // Critically-damped-ish spring on the displayed level, stepped
-        // with real wall-clock dt so the time constants are real-world ms,
-        // not "per tick". Tuned to settle in ~150–200 ms with no
-        // perceptible overshoot — the bars *track* the voice rather than
-        // chase it. ~16 ms tick ≈ 60 fps.
         const STIFFNESS = 360;
         const DAMPING = 32;
         this._lastUpdateMs = GLib.get_monotonic_time() / 1000;
@@ -280,10 +350,6 @@ export default class WhisrsOverlayExtension extends Extension {
         this._level = 0;
     }
 
-    /// Wavy taper across the bar row — center bar at ~100 %, with a cosine
-    /// modulation so adjacent bars alternate between "taller" and "shorter"
-    /// inside a gaussian envelope. Reads as an equalizer pattern instead
-    /// of a smooth bell.
     _taper(i) {
         if (BAR_COUNT <= 1) return 1;
         const center = (BAR_COUNT - 1) / 2;
@@ -302,8 +368,6 @@ export default class WhisrsOverlayExtension extends Extension {
             const grace = this._barsGraceUntil && Date.now() < this._barsGraceUntil;
             const raw = grace ? 0 : (Number.isFinite(this._level) ? this._level : 0);
             const level = Math.max(0, Math.min(1, raw));
-            // Pure level-driven: each bar stays anchored at the pill
-            // center and grows symmetrically. No per-frame phase wobble.
             for (let i = 0; i < this._bars.length; i++) {
                 const taper = this._taper(i);
                 const effective = Math.min(1, Math.max(0, level * taper));

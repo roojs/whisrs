@@ -74,6 +74,8 @@ use x11rb::wrapper::ConnectionExt as X11WrapperConnectionExt;
 
 use crate::{OverlayConfig, State};
 
+use super::transcript;
+
 const BOTTOM_MARGIN: i32 = 16;
 
 // Per-frame sleep matching the draw loop. ~16 ms ≈ 60 fps for visibly
@@ -224,14 +226,18 @@ impl Theme {
 pub async fn spawn_overlay(
     mut state_rx: watch::Receiver<State>,
     mut level_rx: watch::Receiver<f32>,
+    mut text_rx: watch::Receiver<String>,
     config: OverlayConfig,
 ) {
     if is_gnome_desktop() {
         let gnome_state_rx = state_rx.clone();
         let gnome_level_rx = level_rx.clone();
+        let gnome_text_rx = text_rx.clone();
         let gnome_theme = config.theme.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_theme).await
+            if let Err(e) =
+                run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_text_rx, gnome_theme)
+                    .await
             {
                 warn!("GNOME overlay D-Bus broadcaster unavailable: {e:#}");
             }
@@ -240,6 +246,7 @@ pub async fn spawn_overlay(
 
     let (tx, rx) = mpsc::channel::<State>();
     let (level_tx, level_rx_thread) = mpsc::channel::<f32>();
+    let (text_tx, text_rx_thread) = mpsc::channel::<String>();
 
     let backend = OverlayBackend::detect();
     info!("overlay backend selected: {backend:?}");
@@ -248,8 +255,12 @@ pub async fn spawn_overlay(
         .name("whisrs-overlay".to_string())
         .spawn(move || {
             let result = match backend {
-                OverlayBackend::Wayland => run_overlay(rx, level_rx_thread, overlay_config),
-                OverlayBackend::X11 => run_x11_overlay(rx, level_rx_thread, overlay_config),
+                OverlayBackend::Wayland => {
+                    run_overlay(rx, level_rx_thread, text_rx_thread, overlay_config)
+                }
+                OverlayBackend::X11 => {
+                    run_x11_overlay(rx, level_rx_thread, text_rx_thread, overlay_config)
+                }
                 OverlayBackend::Unavailable => {
                     warn!("overlay unavailable: no Wayland or X11 display in environment");
                     return;
@@ -265,6 +276,7 @@ pub async fn spawn_overlay(
     tokio::spawn(async move {
         let _ = tx.send(*state_rx.borrow());
         let _ = level_tx.send(*level_rx.borrow());
+        let _ = text_tx.send(text_rx.borrow().clone());
         loop {
             tokio::select! {
                 changed = state_rx.changed() => {
@@ -274,6 +286,10 @@ pub async fn spawn_overlay(
                 changed = level_rx.changed() => {
                     if changed.is_err() { break; }
                     let _ = level_tx.send(*level_rx.borrow());
+                }
+                changed = text_rx.changed() => {
+                    if changed.is_err() { break; }
+                    let _ = text_tx.send(text_rx.borrow().clone());
                 }
             }
         }
@@ -322,6 +338,7 @@ fn is_gnome_desktop() -> bool {
 async fn run_gnome_broadcaster(
     mut state_rx: watch::Receiver<State>,
     level_rx: watch::Receiver<f32>,
+    mut text_rx: watch::Receiver<String>,
     theme: String,
 ) -> Result<(), OverlayError> {
     // Custom themes don't sync over D-Bus for v1 — the GNOME extension only
@@ -344,6 +361,8 @@ async fn run_gnome_broadcaster(
     emit_gnome_state(&conn, initial_state).await?;
     let initial_level = *level_rx.borrow();
     emit_gnome_level(&conn, initial_level).await?;
+    let initial_text = text_rx.borrow().clone();
+    emit_gnome_text(&conn, &initial_text).await?;
 
     // Emit level at a steady ~30 Hz so the GNOME extension always has fresh
     // data, regardless of how the watch channel coalesces updates.
@@ -358,6 +377,13 @@ async fn run_gnome_broadcaster(
                 }
                 let state = *state_rx.borrow();
                 emit_gnome_state(&conn, state).await?;
+            }
+            changed = text_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let text = text_rx.borrow().clone();
+                emit_gnome_text(&conn, text.as_str()).await?;
             }
             _ = level_interval.tick() => {
                 let level = *level_rx.borrow();
@@ -402,6 +428,17 @@ async fn emit_gnome_theme(conn: &zbus::Connection, theme: &str) -> zbus::Result<
     .await
 }
 
+async fn emit_gnome_text(conn: &zbus::Connection, text: &str) -> zbus::Result<()> {
+    conn.emit_signal(
+        None::<&str>,
+        "/org/whisrs/Overlay",
+        "org.whisrs.Overlay",
+        "TextChanged",
+        &text,
+    )
+    .await
+}
+
 struct GnomeOverlayBus;
 
 #[zbus::interface(name = "org.whisrs.Overlay")]
@@ -414,6 +451,7 @@ impl GnomeOverlayBus {
 fn run_overlay(
     state_rx: mpsc::Receiver<State>,
     level_rx: mpsc::Receiver<f32>,
+    text_rx: mpsc::Receiver<String>,
     config: OverlayConfig,
 ) -> Result<(), OverlayError> {
     let width = config.clamped_width();
@@ -451,7 +489,7 @@ fn run_overlay(
         shm,
         pool,
         layer,
-        renderer: OverlayRenderer::new(state_rx, level_rx, width, height, theme)?,
+        renderer: OverlayRenderer::new(state_rx, level_rx, text_rx, width, height, theme)?,
         exit: false,
         first_configure: true,
     };
@@ -471,10 +509,11 @@ fn run_overlay(
 fn run_x11_overlay(
     state_rx: mpsc::Receiver<State>,
     level_rx: mpsc::Receiver<f32>,
+    text_rx: mpsc::Receiver<String>,
     config: OverlayConfig,
 ) -> Result<(), OverlayError> {
-    let width = config.clamped_width() as u16;
-    let height = config.clamped_height() as u16;
+    let pill_width = config.clamped_width() as u16;
+    let pill_height = config.clamped_height() as u16;
     let theme = Theme::from_config(&config);
 
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -485,8 +524,17 @@ fn run_x11_overlay(
     let colormap = conn.generate_id()?;
     conn.create_colormap(ColormapAlloc::NONE, colormap, screen.root, visual.visual_id)?;
 
-    let x = centered_x(screen, width);
-    let y = bottom_y(screen, height);
+    let mut renderer = OverlayRenderer::new(
+        state_rx,
+        level_rx,
+        text_rx,
+        pill_width as u32,
+        pill_height as u32,
+        theme,
+    )?;
+    let (width, height) = renderer.surface_size();
+    let x = centered_x(screen, width as u16);
+    let y = bottom_y(screen, height as u16);
     let window = conn.generate_id()?;
     conn.create_window(
         visual.depth,
@@ -494,8 +542,8 @@ fn run_x11_overlay(
         screen.root,
         x,
         y,
-        width,
-        height,
+        width as u16,
+        height as u16,
         0,
         WindowClass::INPUT_OUTPUT,
         visual.visual_id,
@@ -514,10 +562,10 @@ fn run_x11_overlay(
     conn.create_gc(gc, window, &CreateGCAux::default().graphics_exposures(0))?;
     conn.flush()?;
 
-    let mut renderer =
-        OverlayRenderer::new(state_rx, level_rx, width as u32, height as u32, theme)?;
     let mut frame = vec![0_u8; width as usize * height as usize * 4];
     let mut mapped = false;
+    let mut surface_w = width;
+    let mut surface_h = height;
     // Cache of the last bounding-shape rectangles applied to the window.
     // Recomputing alpha_shape_rectangles every frame is cheap, but issuing
     // the SHAPE round-trip when geometry hasn't changed is not — skip it.
@@ -535,6 +583,23 @@ fn run_x11_overlay(
         if renderer.disconnected {
             break;
         }
+
+        let (sw, sh) = renderer.surface_size();
+        if sw != surface_w || sh != surface_h {
+            surface_w = sw;
+            surface_h = sh;
+            frame.resize(sw as usize * sh as usize * 4, 0);
+            let (x, y) = x11_overlay_position(&conn, screen, &atoms, sw as u16, sh as u16);
+            conn.configure_window(
+                window,
+                &ConfigureWindowAux::default()
+                    .width(sw)
+                    .height(sh)
+                    .x(i32::from(x))
+                    .y(i32::from(y)),
+            )?;
+        }
+
         let visible_shape = alpha_shape_rectangles(&renderer.pixmap);
         if visible_shape.is_empty() {
             if mapped {
@@ -554,7 +619,7 @@ fn run_x11_overlay(
         }
         copy_pixmap_to_x11_zpixmap(&renderer.pixmap, visual, &mut frame);
         if !mapped {
-            let (x, y) = x11_overlay_position(&conn, screen, &atoms, width, height);
+            let (x, y) = x11_overlay_position(&conn, screen, &atoms, surface_w as u16, surface_h as u16);
             conn.configure_window(
                 window,
                 &ConfigureWindowAux::default()
@@ -569,8 +634,8 @@ fn run_x11_overlay(
             ImageFormat::Z_PIXMAP,
             window,
             gc,
-            width,
-            height,
+            surface_w as u16,
+            surface_h as u16,
             0,
             0,
             0,
@@ -959,9 +1024,14 @@ struct Overlay {
 struct OverlayRenderer {
     state_rx: mpsc::Receiver<State>,
     level_rx: mpsc::Receiver<f32>,
+    text_rx: mpsc::Receiver<String>,
+    pill_width: u32,
+    pill_height: u32,
     width: u32,
     height: u32,
     pixmap: Pixmap,
+    transcript: String,
+    transcript_panel: Option<transcript::TranscriptPanel>,
     target_state: State,
     visible_state: State,
     /// Wall-clock instant when the current spawn animation started. The
@@ -1015,17 +1085,24 @@ impl OverlayRenderer {
     fn new(
         state_rx: mpsc::Receiver<State>,
         level_rx: mpsc::Receiver<f32>,
-        width: u32,
-        height: u32,
+        text_rx: mpsc::Receiver<String>,
+        pill_width: u32,
+        pill_height: u32,
         theme: Theme,
     ) -> Result<Self, OverlayError> {
+        let (width, height) = (pill_width, pill_height);
         let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
         Ok(Self {
             state_rx,
             level_rx,
+            text_rx,
+            pill_width,
+            pill_height,
             width,
             height,
             pixmap,
+            transcript: String::new(),
+            transcript_panel: transcript::TranscriptPanel::try_new(),
             target_state: State::Idle,
             visible_state: State::Idle,
             spawn_started: Instant::now(),
@@ -1038,6 +1115,59 @@ impl OverlayRenderer {
             last_update: Instant::now(),
             theme,
         })
+    }
+
+    fn surface_size(&self) -> (u32, u32) {
+        let lines = self
+            .transcript_panel
+            .as_ref()
+            .map(|panel| {
+                panel.wrap_lines(
+                    &self.transcript,
+                    transcript::PANEL_WIDTH as f32 - transcript::PADDING * 2.0,
+                )
+            })
+            .unwrap_or_default();
+        let text_h = self
+            .transcript_panel
+            .as_ref()
+            .map(|panel| panel.panel_height(lines.len()))
+            .unwrap_or(0);
+        let width = if lines.is_empty() {
+            self.pill_width
+        } else {
+            self.pill_width.max(transcript::PANEL_WIDTH)
+        };
+        let height = if text_h > 0 {
+            self.pill_height + text_h + transcript::GAP_ABOVE_PILL as u32
+        } else {
+            self.pill_height
+        };
+        (width, height)
+    }
+
+    fn resize_if_needed(&mut self) -> Result<(), OverlayError> {
+        let (width, height) = self.surface_size();
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        self.width = width;
+        self.height = height;
+        self.pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
+        Ok(())
+    }
+
+    fn apply_text_updates(&mut self) {
+        loop {
+            match self.text_rx.try_recv() {
+                Ok(text) => self.transcript = text,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.disconnected = true;
+                    break;
+                }
+            }
+        }
     }
 
     fn apply_state_updates(&mut self) {
@@ -1178,9 +1308,26 @@ impl OverlayRenderer {
 
     fn draw_frame(&mut self) {
         self.apply_state_updates();
+        self.apply_text_updates();
+        let _ = self.resize_if_needed();
 
-        let anim = self.anim(self.height as f32);
+        let anim = self.anim(self.pill_height as f32);
         let level_gated = if anim.bars_locked { 0.0 } else { self.level };
+        let lines = self
+            .transcript_panel
+            .as_ref()
+            .map(|panel| {
+                panel.wrap_lines(
+                    &self.transcript,
+                    transcript::PANEL_WIDTH as f32 - transcript::PADDING * 2.0,
+                )
+            })
+            .unwrap_or_default();
+        let text_panel_h = self
+            .transcript_panel
+            .as_ref()
+            .map(|panel| panel.panel_height(lines.len()))
+            .unwrap_or(0) as f32;
         draw_overlay(
             &mut self.pixmap,
             self.visible_state,
@@ -1188,6 +1335,11 @@ impl OverlayRenderer {
             level_gated,
             anim,
             &self.theme,
+            self.pill_width as f32,
+            self.pill_height as f32,
+            self.transcript_panel.as_ref(),
+            &lines,
+            text_panel_h,
         );
         self.frame = self.frame.wrapping_add(1);
     }
@@ -1434,6 +1586,11 @@ fn draw_overlay(
     level: f32,
     anim: AnimState,
     theme: &Theme,
+    pill_width: f32,
+    pill_height: f32,
+    transcript_panel: Option<&transcript::TranscriptPanel>,
+    transcript_lines: &[String],
+    text_panel_h: f32,
 ) {
     pixmap.fill(Color::TRANSPARENT);
 
@@ -1443,15 +1600,29 @@ fn draw_overlay(
 
     let surface_w = pixmap.width() as f32;
     let surface_h = pixmap.height() as f32;
-    let pill_h = anim.pill_height.clamp(SPAWN_PILL_MIN_H, surface_h);
-    let pill_y = surface_h - pill_h; // bottom-anchored
-    let pill_w = surface_w;
+    let pill_h = anim.pill_height.clamp(SPAWN_PILL_MIN_H, pill_height);
+    let pill_y = surface_h - pill_h;
+    let pill_x = ((surface_w - pill_width) / 2.0).max(0.0);
 
-    // Outer pill — drawn in the *ring* color first. We then paint a 1 px
-    // inset pill in the *bg* color so the visible result is a perfectly
-    // even 1 px ring with no stroke-math seams. This avoids the corner
-    // join artifacts that a tiny-skia stroke produces on tight pills.
-    let outer = build_stadium(0.0, pill_y, pill_w, pill_h);
+    if text_panel_h > 0.0 && !transcript_lines.is_empty() {
+        if let Some(panel) = transcript_panel {
+            let panel_y = pill_y - transcript::GAP_ABOVE_PILL - text_panel_h;
+            let bg = theme_color(theme.bg, anim.pill_alpha);
+            let fg = theme_color(theme.trans_bar, anim.pill_alpha);
+            panel.draw(
+                pixmap,
+                transcript_lines,
+                panel_y,
+                surface_w,
+                text_panel_h,
+                bg,
+                fg,
+                anim.pill_alpha,
+            );
+        }
+    }
+
+    let outer = build_stadium(pill_x, pill_y, pill_width, pill_h);
     if let Some(path) = &outer {
         let mut paint = Paint {
             anti_alias: true,
@@ -1461,8 +1632,13 @@ fn draw_overlay(
         pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
-    if pill_w > 2.0 && pill_h > 2.0 {
-        let inner = build_stadium(1.0, pill_y + 1.0, pill_w - 2.0, pill_h - 2.0);
+    if pill_width > 2.0 && pill_h > 2.0 {
+        let inner = build_stadium(
+            pill_x + 1.0,
+            pill_y + 1.0,
+            pill_width - 2.0,
+            pill_h - 2.0,
+        );
         if let Some(path) = &inner {
             let mut paint = Paint {
                 anti_alias: true,
@@ -1477,13 +1653,7 @@ fn draw_overlay(
         return;
     }
 
-    // Bars sit at the *final* pill center — the surface midpoint — not at
-    // the currently animating pill_cy. While the pill is still growing
-    // upward from the bottom edge, this keeps the bars planted at one fixed
-    // y so they read as "expanding amplitude" rather than "translating up
-    // with the pill". The pill's bottom-anchored grow still happens
-    // visually; the bars just don't follow its center-of-mass.
-    let pill_cy = surface_h / 2.0;
+    let pill_cy = pill_y + pill_h / 2.0;
     match state {
         State::Recording => draw_bars(pixmap, theme, theme.rec_bar, level, anim, pill_cy),
         // Read-aloud playback reuses the equalizer bars in a distinct hue,
@@ -1741,11 +1911,44 @@ mod tests {
         }
     }
 
+    fn draw_test(
+        pm: &mut Pixmap,
+        state: State,
+        anim: AnimState,
+        theme: &Theme,
+    ) {
+        draw_overlay(
+            pm,
+            state,
+            0,
+            1.0,
+            anim,
+            theme,
+            100.0,
+            40.0,
+            None,
+            &[],
+            0.0,
+        );
+    }
+
     #[test]
     fn idle_draw_is_transparent() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t);
+        draw_overlay(
+            &mut pm,
+            State::Idle,
+            0,
+            0.0,
+            hidden(),
+            &t,
+            100.0,
+            40.0,
+            None,
+            &[],
+            0.0,
+        );
         assert!(pm.data().iter().all(|b| *b == 0));
     }
 
@@ -1753,7 +1956,7 @@ mod tests {
     fn faded_out_draw_is_transparent() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t);
+        draw_test(&mut pm, State::Recording, hidden(), &t);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
 
@@ -1761,7 +1964,7 @@ mod tests {
     fn active_draw_has_visible_pixels() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t);
+        draw_test(&mut pm, State::Recording, shown(), &t);
         // tiny-skia stores premultiplied RGBA; alpha lives in the 4th byte.
         assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
     }
@@ -1781,8 +1984,8 @@ mod tests {
         let t = Theme::ember();
         let mut rec = fresh_pixmap();
         let mut spk = fresh_pixmap();
-        draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t);
-        draw_overlay(&mut spk, State::Speaking, 0, 1.0, shown(), &t);
+        draw_test(&mut rec, State::Recording, shown(), &t);
+        draw_test(&mut spk, State::Speaking, shown(), &t);
         let rec_green = green_dominant(rec.data());
         let spk_green = green_dominant(spk.data());
         assert!(
@@ -1796,7 +1999,7 @@ mod tests {
     fn synthesizing_draws_visible_pixels() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t);
+        draw_test(&mut pm, State::Synthesizing, shown(), &t);
         assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
     }
 
@@ -1851,8 +2054,32 @@ mod tests {
         let t = Theme::ember();
         let mut quiet = fresh_pixmap();
         let mut loud = fresh_pixmap();
-        draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t);
-        draw_overlay(&mut loud, State::Recording, 0, 1.0, shown(), &t);
+        draw_overlay(
+            &mut quiet,
+            State::Recording,
+            0,
+            0.0,
+            shown(),
+            &t,
+            100.0,
+            40.0,
+            None,
+            &[],
+            0.0,
+        );
+        draw_overlay(
+            &mut loud,
+            State::Recording,
+            0,
+            1.0,
+            shown(),
+            &t,
+            100.0,
+            40.0,
+            None,
+            &[],
+            0.0,
+        );
         let count_quiet = amber_pixels(quiet.data());
         let count_loud = amber_pixels(loud.data());
         assert!(
