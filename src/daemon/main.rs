@@ -28,7 +28,8 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
-    encode_message, read_message, socket_path, strip_trailing_sentence_punctuation, Command,
+    encode_message, normalize_sentence_spacing, read_message, socket_path,
+    strip_trailing_sentence_punctuation, Command,
     Config, InjectorBackend, Response, State,
 };
 
@@ -42,9 +43,11 @@ const REVIEW_MIN_PREVIEW_INTERVAL_MS: u64 = 2000;
 /// Minimum new audio (ms) since the last preview before running another pass.
 const REVIEW_MIN_NEW_AUDIO_MS: u64 = 1200;
 /// While the user is still speaking, refresh the preview at most this often.
-const REVIEW_PERIODIC_INTERVAL_MS: u64 = 4500;
+const REVIEW_PERIODIC_INTERVAL_MS: u64 = 2800;
 /// Do not preview until at least this much audio has been captured.
-const REVIEW_MIN_AUDIO_MS: u64 = 1500;
+const REVIEW_MIN_AUDIO_MS: u64 = 1000;
+/// First overlay update: run as soon as this much speech has been captured.
+const REVIEW_FIRST_PREVIEW_AUDIO_MS: u64 = 700;
 
 /// Context saved when command mode starts recording.
 struct CommandModeContext {
@@ -1325,6 +1328,29 @@ fn review_min_samples(duration_ms: u64) -> usize {
     ((duration_ms * SAMPLE_RATE as u64) / 1000).max(1) as usize
 }
 
+fn review_preview_may_run(st: &ReviewPreviewState, total: usize, force: bool) -> bool {
+    if force {
+        return total > 0;
+    }
+    let first = st.last_preview_samples == 0;
+    let min_audio = if first {
+        review_min_samples(REVIEW_FIRST_PREVIEW_AUDIO_MS)
+    } else {
+        review_min_samples(REVIEW_MIN_AUDIO_MS)
+    };
+    if total < min_audio || total <= st.last_preview_samples {
+        return false;
+    }
+    if first {
+        return true;
+    }
+    let new_samples = total.saturating_sub(st.last_preview_samples);
+    if new_samples < review_min_samples(REVIEW_MIN_NEW_AUDIO_MS) {
+        return false;
+    }
+    st.last_preview_at.elapsed().as_millis() >= REVIEW_MIN_PREVIEW_INTERVAL_MS as u128
+}
+
 async fn transcribe_recording_preview(
     backend: &Arc<dyn TranscriptionBackend>,
     samples: &[i16],
@@ -1339,7 +1365,7 @@ async fn transcribe_recording_preview(
     if let Some(filter) = filler_filter {
         text = filter.apply(&text);
     }
-    Ok(text)
+    Ok(normalize_sentence_spacing(&text))
 }
 
 async fn run_review_preview(
@@ -1358,17 +1384,7 @@ async fn run_review_preview(
             return;
         }
         if !force {
-            if total < review_min_samples(REVIEW_MIN_AUDIO_MS) {
-                return;
-            }
-            if total <= st.last_preview_samples {
-                return;
-            }
-            let new_samples = total.saturating_sub(st.last_preview_samples);
-            if new_samples < review_min_samples(REVIEW_MIN_NEW_AUDIO_MS) {
-                return;
-            }
-            if st.last_preview_at.elapsed().as_millis() < REVIEW_MIN_PREVIEW_INTERVAL_MS as u128 {
+            if !review_preview_may_run(&st, total, false) {
                 return;
             }
         } else if total == 0 {
@@ -1427,6 +1443,34 @@ fn spawn_review_preview(
         )
         .await;
     });
+}
+
+async fn schedule_review_preview(
+    preview_state: &Arc<Mutex<ReviewPreviewState>>,
+    backend: &Arc<dyn TranscriptionBackend>,
+    config: &TranscriptionConfig,
+    recording_audio: &[i16],
+    overlay_text_tx: &Option<tokio::sync::watch::Sender<String>>,
+    filler_enabled: bool,
+    filler_words: &[String],
+) {
+    let total = recording_audio.len();
+    let should = {
+        let st = preview_state.lock().await;
+        !st.in_flight && review_preview_may_run(&st, total, false)
+    };
+    if !should {
+        return;
+    }
+    spawn_review_preview(
+        Arc::clone(preview_state),
+        Arc::clone(backend),
+        config.clone(),
+        recording_audio.to_vec(),
+        overlay_text_tx.clone(),
+        filler_enabled,
+        filler_words.to_vec(),
+    );
 }
 
 async fn wait_for_review_preview(state: &Arc<Mutex<ReviewPreviewState>>) {
@@ -1561,37 +1605,54 @@ async fn run_review_streaming_pipeline(
             break;
         }
 
+        if auto_stop.has_speech() && !chunk_is_silent {
+            schedule_review_preview(
+                &preview_state,
+                &backend,
+                &config,
+                &recording_audio,
+                &overlay_text_tx,
+                filler_enabled,
+                &filler_words,
+            )
+            .await;
+        }
+
         if phrase_pause.feed(&chunk) {
             if !phrase_pause_latched && auto_stop.has_speech() {
                 phrase_pause_latched = true;
-                spawn_review_preview(
-                    Arc::clone(&preview_state),
-                    Arc::clone(&backend),
-                    config.clone(),
-                    recording_audio.clone(),
-                    overlay_text_tx.clone(),
+                schedule_review_preview(
+                    &preview_state,
+                    &backend,
+                    &config,
+                    &recording_audio,
+                    &overlay_text_tx,
                     filler_enabled,
-                    filler_words.clone(),
-                );
+                    &filler_words,
+                )
+                .await;
             }
         } else if !chunk_is_silent {
             phrase_pause_latched = false;
             let periodic_due = {
                 let st = preview_state.lock().await;
-                st.last_preview_at.elapsed().as_millis() >= REVIEW_PERIODIC_INTERVAL_MS as u128
+                st.last_preview_samples > 0
+                    && st.last_preview_at.elapsed().as_millis()
+                        >= REVIEW_PERIODIC_INTERVAL_MS as u128
                     && recording_audio.len()
                         > st.last_preview_samples + review_min_samples(REVIEW_MIN_NEW_AUDIO_MS)
             };
             if periodic_due {
-                spawn_review_preview(
-                    Arc::clone(&preview_state),
-                    Arc::clone(&backend),
-                    config.clone(),
-                    recording_audio.clone(),
-                    overlay_text_tx.clone(),
+                schedule_review_preview(
+                    &preview_state,
+                    &backend,
+                    &config,
+                    &recording_audio,
+                    &overlay_text_tx,
                     filler_enabled,
-                    filler_words.clone(),
-                );
+                    &filler_words,
+                )
+                .await;
             }
         }
     }
