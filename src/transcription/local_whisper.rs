@@ -3,8 +3,8 @@
 //! Uses whisper-rs with a sliding window approach for pseudo-streaming.
 //!
 //! Live typing mode: each window is deduplicated against committed text and
-//! only novel suffixes are emitted. Review/overlay mode: windows are sent as
-//! live preview only; the daemon runs one full-audio transcription for paste.
+//! only novel suffixes are emitted. Review/overlay mode uses full-audio
+//! re-transcription in the daemon instead of this streaming path.
 
 use std::sync::Arc;
 

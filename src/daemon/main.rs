@@ -35,6 +35,17 @@ use whisrs::{
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
 const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Short pause (ms) that triggers a full-audio review preview update.
+const REVIEW_PHRASE_PAUSE_MS: u64 = 800;
+/// Minimum time between whisper passes during review preview.
+const REVIEW_MIN_PREVIEW_INTERVAL_MS: u64 = 2000;
+/// Minimum new audio (ms) since the last preview before running another pass.
+const REVIEW_MIN_NEW_AUDIO_MS: u64 = 1200;
+/// While the user is still speaking, refresh the preview at most this often.
+const REVIEW_PERIODIC_INTERVAL_MS: u64 = 4500;
+/// Do not preview until at least this much audio has been captured.
+const REVIEW_MIN_AUDIO_MS: u64 = 1500;
+
 /// Context saved when command mode starts recording.
 struct CommandModeContext {
     selected_text: String,
@@ -1303,6 +1314,401 @@ async fn handle_toggle(
     }
 }
 
+struct ReviewPreviewState {
+    text: String,
+    last_preview_samples: usize,
+    last_preview_at: std::time::Instant,
+    in_flight: bool,
+}
+
+fn review_min_samples(duration_ms: u64) -> usize {
+    ((duration_ms * SAMPLE_RATE as u64) / 1000).max(1) as usize
+}
+
+async fn transcribe_recording_preview(
+    backend: &Arc<dyn TranscriptionBackend>,
+    samples: &[i16],
+    config: &TranscriptionConfig,
+    filler_filter: Option<&FillerFilter>,
+) -> Result<String> {
+    if samples.is_empty() {
+        return Ok(String::new());
+    }
+    let wav = encode_wav(samples).context("encode recording for review preview")?;
+    let mut text = backend.transcribe(&wav, config).await?;
+    if let Some(filter) = filler_filter {
+        text = filter.apply(&text);
+    }
+    Ok(text)
+}
+
+async fn run_review_preview(
+    state: &Arc<Mutex<ReviewPreviewState>>,
+    backend: Arc<dyn TranscriptionBackend>,
+    config: TranscriptionConfig,
+    samples: Vec<i16>,
+    overlay_tx: Option<tokio::sync::watch::Sender<String>>,
+    filler_filter: Option<FillerFilter>,
+    force: bool,
+) {
+    let total = samples.len();
+    {
+        let st = state.lock().await;
+        if st.in_flight {
+            return;
+        }
+        if !force {
+            if total < review_min_samples(REVIEW_MIN_AUDIO_MS) {
+                return;
+            }
+            if total <= st.last_preview_samples {
+                return;
+            }
+            let new_samples = total.saturating_sub(st.last_preview_samples);
+            if new_samples < review_min_samples(REVIEW_MIN_NEW_AUDIO_MS) {
+                return;
+            }
+            if st.last_preview_at.elapsed().as_millis() < REVIEW_MIN_PREVIEW_INTERVAL_MS as u128 {
+                return;
+            }
+        } else if total == 0 {
+            return;
+        }
+    }
+
+    {
+        let mut st = state.lock().await;
+        st.in_flight = true;
+    }
+
+    let result =
+        transcribe_recording_preview(&backend, &samples, &config, filler_filter.as_ref()).await;
+
+    let mut st = state.lock().await;
+    st.in_flight = false;
+    match result {
+        Ok(text) if !text.trim().is_empty() => {
+            info!("review preview: {} chars ({} samples)", text.len(), total);
+            st.text = text;
+            st.last_preview_samples = total;
+            st.last_preview_at = std::time::Instant::now();
+            if let Some(tx) = overlay_tx {
+                let _ = tx.send(st.text.clone());
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!("review preview failed: {e:#}"),
+    }
+}
+
+fn spawn_review_preview(
+    state: Arc<Mutex<ReviewPreviewState>>,
+    backend: Arc<dyn TranscriptionBackend>,
+    config: TranscriptionConfig,
+    samples: Vec<i16>,
+    overlay_tx: Option<tokio::sync::watch::Sender<String>>,
+    filler_enabled: bool,
+    filler_words: Vec<String>,
+) {
+    tokio::spawn(async move {
+        let filler_filter = if filler_enabled {
+            FillerFilter::new(&filler_words).ok()
+        } else {
+            None
+        };
+        run_review_preview(
+            &state,
+            backend,
+            config,
+            samples,
+            overlay_tx,
+            filler_filter,
+            false,
+        )
+        .await;
+    });
+}
+
+async fn wait_for_review_preview(state: &Arc<Mutex<ReviewPreviewState>>) {
+    for _ in 0..200 {
+        if !state.lock().await.in_flight {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    warn!("timed out waiting for in-flight review preview");
+}
+
+/// Review-before-paste pipeline: tee the full recording and re-transcribe it
+/// intermittently for the overlay preview (whole utterance, not sliding chunks).
+#[allow(clippy::too_many_arguments)]
+async fn run_review_streaming_pipeline(
+    mut audio_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<i16>>,
+    backend: Arc<dyn TranscriptionBackend>,
+    config: TranscriptionConfig,
+    window_id: Option<String>,
+    notify: bool,
+    overlay_enabled: bool,
+    silence_timeout_ms: u64,
+    daemon_state: Arc<Mutex<DaemonState>>,
+    window_tracker: Arc<dyn WindowTracker>,
+    filler_enabled: bool,
+    filler_words: Vec<String>,
+    audio_feedback: bool,
+    audio_feedback_volume: f32,
+    backend_name: String,
+    language: String,
+    state_tx: tokio::sync::watch::Sender<State>,
+    key_delay: std::time::Duration,
+    injector_backend: InjectorBackend,
+    buffer_hint: Option<Arc<BufferHint>>,
+    overlay_text_tx: Option<tokio::sync::watch::Sender<String>>,
+) -> Result<String> {
+    let notify_state = notify && !overlay_enabled;
+    let pipeline_start = std::time::Instant::now();
+    let filler_filter = if filler_enabled {
+        Some(
+            FillerFilter::new(&filler_words)
+                .context("invalid custom filler word in configuration")?,
+        )
+    } else {
+        None
+    };
+
+    let preview_state = Arc::new(Mutex::new(ReviewPreviewState {
+        text: String::new(),
+        last_preview_samples: 0,
+        last_preview_at: std::time::Instant::now(),
+        in_flight: false,
+    }));
+
+    let mut auto_stop =
+        AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
+    let mut phrase_pause =
+        AutoStopDetector::new(SILENCE_RMS_THRESHOLD, REVIEW_PHRASE_PAUSE_MS, SAMPLE_RATE);
+    let mut phrase_pause_latched = false;
+    let mut buffering_countdown_started = false;
+    let mut recording_audio = Vec::new();
+
+    while let Some(chunk) = audio_rx.recv().await {
+        recording_audio.extend_from_slice(&chunk);
+        let had_speech = auto_stop.has_speech();
+        let chunk_is_silent = audio_silence_gate::is_silent(&chunk, SILENCE_RMS_THRESHOLD);
+
+        if let (Some(hint), Some(wid)) = (&buffer_hint, &window_id) {
+            if !buffering_countdown_started
+                && !had_speech
+                && !chunk_is_silent
+            {
+                buffering_countdown_started = true;
+                hint.start_buffering();
+                let hint_clone = Arc::clone(hint);
+                let wid = wid.clone();
+                let tracker = Arc::clone(&window_tracker);
+                info!("speech detected — switching hint to buffering countdown");
+                let prev_len = hint_clone
+                    .char_len
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                match tokio::task::spawn_blocking({
+                    let tracker = Arc::clone(&tracker);
+                    let wid = wid.clone();
+                    move || {
+                        insert_at_target(
+                            BUFFER_HINT_INITIAL,
+                            Some(&wid),
+                            tracker.as_ref(),
+                            prev_len,
+                            key_delay,
+                            injector_backend,
+                        )
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(())) => {
+                        hint_clone.set_len(BUFFER_HINT_INITIAL.len());
+                        tokio::spawn(run_buffer_countdown(
+                            hint_clone,
+                            wid,
+                            tracker,
+                            key_delay,
+                            injector_backend,
+                        ));
+                    }
+                    Ok(Err(e)) => warn!("failed to switch to buffer hint: {e:#}"),
+                    Err(e) => warn!("buffer hint switch task failed: {e}"),
+                }
+            }
+        }
+
+        if auto_stop.feed(&chunk) {
+            info!("silence auto-stop triggered after {silence_timeout_ms}ms");
+            if notify_state {
+                send_notification("whisrs", "Auto-stopped (silence detected)");
+            }
+            let mut ds = daemon_state.lock().await;
+            if ds.state_machine.state() == State::Recording {
+                if let Some(mut capture) = ds.audio_capture.take() {
+                    capture.stop();
+                    tokio::task::spawn_blocking(move || drop(capture));
+                }
+                if let Err(e) = ds.state_machine.transition(Action::Toggle) {
+                    warn!("auto-stop state transition failed: {e}");
+                } else {
+                    let _ = state_tx.send(ds.state_machine.state());
+                }
+            }
+            break;
+        }
+
+        if phrase_pause.feed(&chunk) {
+            if !phrase_pause_latched && auto_stop.has_speech() {
+                phrase_pause_latched = true;
+                spawn_review_preview(
+                    Arc::clone(&preview_state),
+                    Arc::clone(&backend),
+                    config.clone(),
+                    recording_audio.clone(),
+                    overlay_text_tx.clone(),
+                    filler_enabled,
+                    filler_words.clone(),
+                );
+            }
+        } else if !chunk_is_silent {
+            phrase_pause_latched = false;
+            let periodic_due = {
+                let st = preview_state.lock().await;
+                st.last_preview_at.elapsed().as_millis() >= REVIEW_PERIODIC_INTERVAL_MS as u128
+                    && recording_audio.len()
+                        > st.last_preview_samples + review_min_samples(REVIEW_MIN_NEW_AUDIO_MS)
+            };
+            if periodic_due {
+                spawn_review_preview(
+                    Arc::clone(&preview_state),
+                    Arc::clone(&backend),
+                    config.clone(),
+                    recording_audio.clone(),
+                    overlay_text_tx.clone(),
+                    filler_enabled,
+                    filler_words.clone(),
+                );
+            }
+        }
+    }
+
+    while let Some(chunk) = audio_rx.recv().await {
+        recording_audio.extend_from_slice(&chunk);
+    }
+
+    wait_for_review_preview(&preview_state).await;
+    if !recording_audio.is_empty() {
+        let needs_final = {
+            let st = preview_state.lock().await;
+            st.text.is_empty() || recording_audio.len() > st.last_preview_samples
+        };
+        if needs_final {
+            run_review_preview(
+                &preview_state,
+                Arc::clone(&backend),
+                config.clone(),
+                recording_audio.clone(),
+                overlay_text_tx.clone(),
+                filler_filter,
+                true,
+            )
+            .await;
+        }
+    }
+
+    let full_text = preview_state.lock().await.text.clone();
+
+    let full_text = if !full_text.trim().is_empty() {
+        if overlay_enabled {
+            match commit_transcription(
+                &full_text,
+                window_id.as_deref(),
+                &window_tracker,
+                key_delay,
+                injector_backend,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!("failed to paste reviewed transcription: {e:#}");
+                    full_text
+                }
+            }
+        } else {
+            match review_and_commit_transcription(
+                &full_text,
+                window_id.as_deref(),
+                &window_tracker,
+                key_delay,
+                injector_backend,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!("review dialog failed: {e:#}");
+                    full_text
+                }
+            }
+        }
+    } else {
+        full_text
+    };
+
+    if let Some(tx) = &overlay_text_tx {
+        let _ = tx.send(String::new());
+    }
+
+    if !full_text.is_empty() {
+        let duration_secs = pipeline_start.elapsed().as_secs_f64();
+        save_history_entry(&full_text, &backend_name, &language, duration_secs);
+    }
+
+    let mut ds = daemon_state.lock().await;
+    if ds.state_machine.state() == State::Transcribing {
+        debug!("review pipeline transitioning daemon state back to idle");
+        ds.state_machine.transition(Action::TranscriptionDone).ok();
+        let _ = state_tx.send(ds.state_machine.state());
+        if audio_feedback {
+            feedback::play_done(audio_feedback_volume);
+        }
+        if notify_state {
+            let preview = truncate_preview(&full_text, 77);
+            if !preview.is_empty() {
+                send_notification("whisrs", &format!("Done: {preview}"));
+            }
+        }
+    }
+
+    if let Some(hint) = &buffer_hint {
+        if !hint.is_cancelled() {
+            let clear_len = hint.cancel();
+            if clear_len > 0 {
+                let wid = window_id.clone();
+                let tracker = Arc::clone(&window_tracker);
+                let _ = tokio::task::spawn_blocking(move || {
+                    insert_at_target(
+                        "",
+                        wid.as_deref(),
+                        tracker.as_ref(),
+                        clear_len,
+                        key_delay,
+                        injector_backend,
+                    )
+                })
+                .await;
+            }
+        }
+    }
+
+    Ok(full_text)
+}
+
 /// The streaming pipeline: reads audio in real-time, sends to API, types text.
 /// Also monitors for silence auto-stop.
 #[allow(clippy::too_many_arguments)]
@@ -1330,6 +1736,32 @@ async fn run_streaming_pipeline(
     review_before_paste: bool,
     overlay_text_tx: Option<tokio::sync::watch::Sender<String>>,
 ) -> Result<String> {
+    if review_before_paste {
+        return run_review_streaming_pipeline(
+            audio_rx,
+            backend,
+            config,
+            window_id,
+            notify,
+            overlay_enabled,
+            silence_timeout_ms,
+            daemon_state,
+            window_tracker,
+            filler_enabled,
+            filler_words,
+            audio_feedback,
+            audio_feedback_volume,
+            backend_name,
+            language,
+            state_tx,
+            key_delay,
+            injector_backend,
+            buffer_hint,
+            overlay_text_tx,
+        )
+        .await;
+    }
+
     // State-progress toasts are noise when the overlay is on.
     let notify_state = notify && !overlay_enabled;
     let notify_error = notify;
@@ -1350,7 +1782,6 @@ async fn run_streaming_pipeline(
 
     // Spawn the transcription backend.
     let config_clone = config.clone();
-    let backend_for_final = Arc::clone(&backend);
     let backend_task = tokio::spawn(async move {
         backend
             .transcribe_stream(backend_rx, text_tx, &config_clone)
@@ -1363,8 +1794,6 @@ async fn run_streaming_pipeline(
     let wid = window_id.clone();
     let buffer_hint_for_typing = buffer_hint.clone();
     let window_tracker_for_typing = Arc::clone(&window_tracker);
-    let review_mode = review_before_paste;
-    let overlay_text = overlay_text_tx.clone();
     let typing_task = tokio::spawn(async move {
         let mut full_text = String::new();
         let mut hint_cleared = buffer_hint_for_typing.is_none();
@@ -1397,17 +1826,13 @@ async fn run_streaming_pipeline(
                 }
             }
 
-            // Drop overlap with text already typed this session. Streaming
+            // Drop overlap with text already committed this session. Streaming
             // backends (Deepgram, Groq chunks, server VAD) emit a fresh final
-            // after each pause; without this, the last word is often repeated.
-            // In review/overlay mode we show a live preview and transcribe the
-            // full recording once at the end — skip dedup here.
-            if !review_mode {
-                batch = dedup_window_text(&full_text, &batch);
-                if batch.trim().is_empty() {
-                    debug!("skipping duplicate streaming batch after dedup");
-                    continue;
-                }
+            // after each pause; whisper sliding windows re-transcribe overlap.
+            batch = dedup_window_text(&full_text, &batch);
+            if batch.trim().is_empty() {
+                debug!("skipping duplicate streaming batch after dedup");
+                continue;
             }
 
             if !smart_punctuation {
@@ -1420,7 +1845,7 @@ async fn run_streaming_pipeline(
             // Re-focus the insert target before every batch when the compositor
             // supports it (Hyprland, Sway, etc.). On GNOME/KDE we type at the
             // current cursor — stay in your field while recording.
-            if !review_mode && window_tracker_for_typing.supports_focus_restore() {
+            if window_tracker_for_typing.supports_focus_restore() {
                 if let Some(wid) = &wid {
                     let wid_clone = wid.clone();
                     let tracker = Arc::clone(&window_tracker_for_typing);
@@ -1435,10 +1860,7 @@ async fn run_streaming_pipeline(
             // Add space separator between turns if needed.
             // Don't insert a space before punctuation streaming deltas,
             // as they arrive as bare tokens.
-            let text_to_type = if review_mode {
-                // Live overlay preview: show the latest chunk/window as-is.
-                batch.clone()
-            } else if full_text.is_empty()
+            let text_to_type = if full_text.is_empty()
                 || batch.starts_with(' ')
                 || full_text.ends_with(' ')
                 || leads_with_punct(&batch)
@@ -1447,15 +1869,6 @@ async fn run_streaming_pipeline(
             } else {
                 format!(" {batch}")
             };
-
-            if review_mode {
-                full_text = text_to_type.clone();
-                if let Some(tx) = &overlay_text {
-                    let _ = tx.send(full_text.clone());
-                }
-                info!("review preview: {:?}", text_to_type);
-                continue;
-            }
 
             full_text.push_str(&text_to_type);
 
@@ -1496,13 +1909,8 @@ async fn run_streaming_pipeline(
     let mut auto_stop =
         AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
     let mut buffering_countdown_started = false;
-    let mut recording_audio = Vec::new();
-    let tee_audio = review_before_paste;
 
     while let Some(chunk) = audio_rx.recv().await {
-        if tee_audio {
-            recording_audio.extend_from_slice(&chunk);
-        }
         let had_speech = auto_stop.has_speech();
 
         if let (Some(hint), Some(wid)) = (&buffer_hint, &window_id) {
@@ -1583,9 +1991,6 @@ async fn run_streaming_pipeline(
 
     // Drain remaining audio from the capture channel into the backend.
     while let Some(chunk) = audio_rx.recv().await {
-        if tee_audio {
-            recording_audio.extend_from_slice(&chunk);
-        }
         if audio_tx.send(chunk).await.is_err() {
             break;
         }
@@ -1641,36 +2046,6 @@ async fn run_streaming_pipeline(
         }
     };
 
-    // Review mode: one accurate full-audio pass for paste; streaming output was
-    // only a live overlay preview.
-    let full_text = if review_before_paste && !recording_audio.is_empty() {
-        match encode_wav(&recording_audio) {
-            Ok(wav) => match backend_for_final.transcribe(&wav, &config).await {
-                Ok(final_text) if !final_text.trim().is_empty() => {
-                    info!(
-                        "final review transcription: {} chars (replacing live preview)",
-                        final_text.len()
-                    );
-                    if let Some(tx) = &overlay_text_tx {
-                        let _ = tx.send(final_text.clone());
-                    }
-                    final_text
-                }
-                Ok(_) => full_text,
-                Err(e) => {
-                    warn!("final review transcription failed: {e:#} — using live preview");
-                    full_text
-                }
-            },
-            Err(e) => {
-                warn!("failed to encode recording for final transcription: {e:#}");
-                full_text
-            }
-        }
-    } else {
-        full_text
-    };
-
     // Notify user about streaming errors.
     if let Some(err_msg) = &stream_error {
         if notify_error {
@@ -1684,46 +2059,6 @@ async fn run_streaming_pipeline(
             }
         }
     }
-
-    // Review + paste when enabled. With overlay on, text was already shown
-    // in the panel — paste the final transcript directly.
-    let full_text = if review_before_paste && !full_text.trim().is_empty() {
-        if overlay_enabled {
-            match commit_transcription(
-                &full_text,
-                window_id.as_deref(),
-                &window_tracker,
-                key_delay,
-                injector_backend,
-            )
-            .await
-            {
-                Ok(text) => text,
-                Err(e) => {
-                    warn!("failed to paste reviewed transcription: {e:#}");
-                    full_text
-                }
-            }
-        } else {
-            match review_and_commit_transcription(
-                &full_text,
-                window_id.as_deref(),
-                &window_tracker,
-                key_delay,
-                injector_backend,
-            )
-            .await
-            {
-                Ok(text) => text,
-                Err(e) => {
-                    warn!("review dialog failed: {e:#}");
-                    full_text
-                }
-            }
-        }
-    } else {
-        full_text
-    };
 
     if let Some(tx) = &overlay_text_tx {
         let _ = tx.send(String::new());
