@@ -329,6 +329,20 @@ pub fn strip_trailing_sentence_punctuation(text: &str) -> String {
     s
 }
 
+/// Whisper sometimes omits a space between short words (`andwhether` → `and whether`).
+pub fn split_glued_whisper_words(text: &str) -> String {
+    let mut s = text.to_string();
+    for (from, to) in [
+        ("andwhether", "and whether"),
+        ("Andwhether", "And whether"),
+        ("ifyou", "if you"),
+        ("Ifyou", "If you"),
+    ] {
+        s = s.replace(from, to);
+    }
+    s
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     #[serde(default = "default_device")]
@@ -996,6 +1010,16 @@ mod tests {
                 state: State::Recording
             }
         ));
+    }
+
+    #[test]
+    fn split_glued_whisper_words_fixes_andwhether() {
+        assert_eq!(
+            split_glued_whisper_words(
+                "picking up the conversation andwhether or not it can review"
+            ),
+            "picking up the conversation and whether or not it can review"
+        );
     }
 
     #[test]

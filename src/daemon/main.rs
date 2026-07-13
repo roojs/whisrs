@@ -28,7 +28,7 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
-    encode_message, read_message, socket_path,
+    encode_message, read_message, socket_path, split_glued_whisper_words,
     strip_trailing_sentence_punctuation, Command,
     Config, InjectorBackend, Response, State,
 };
@@ -1351,30 +1351,13 @@ fn review_preview_may_run(st: &ReviewPreviewState, total: usize, force: bool) ->
     st.last_preview_at.elapsed().as_millis() >= REVIEW_MIN_PREVIEW_INTERVAL_MS as u128
 }
 
-async fn transcribe_recording_preview(
-    backend: &Arc<dyn TranscriptionBackend>,
-    samples: &[i16],
-    config: &TranscriptionConfig,
-    filler_filter: Option<&FillerFilter>,
-) -> Result<String> {
-    if samples.is_empty() {
-        return Ok(String::new());
-    }
-    let wav = encode_wav(samples).context("encode recording for review preview")?;
-    let mut text = backend.transcribe(&wav, config).await?;
-    if let Some(filter) = filler_filter {
-        text = filter.apply(&text);
-    }
-    Ok(text)
-}
-
 async fn run_review_preview(
     state: &Arc<Mutex<ReviewPreviewState>>,
     backend: Arc<dyn TranscriptionBackend>,
-    config: TranscriptionConfig,
+    config: &TranscriptionConfig,
     samples: Vec<i16>,
     overlay_tx: Option<tokio::sync::watch::Sender<String>>,
-    filler_filter: Option<FillerFilter>,
+    filler_filter: Option<&FillerFilter>,
     force: bool,
 ) {
     let total = samples.len();
@@ -1397,8 +1380,18 @@ async fn run_review_preview(
         st.in_flight = true;
     }
 
-    let result =
-        transcribe_recording_preview(&backend, &samples, &config, filler_filter.as_ref()).await;
+    let result = async {
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        let wav = encode_wav(&samples).context("encode recording for review preview")?;
+        let mut text = backend.transcribe(&wav, config).await?;
+        if let Some(filter) = filler_filter {
+            text = filter.apply(&text);
+        }
+        Ok(split_glued_whisper_words(&text))
+    }
+    .await;
 
     let mut st = state.lock().await;
     st.in_flight = false;
@@ -1424,54 +1417,20 @@ fn spawn_review_preview(
     config: TranscriptionConfig,
     samples: Vec<i16>,
     overlay_tx: Option<tokio::sync::watch::Sender<String>>,
-    filler_enabled: bool,
-    filler_words: Vec<String>,
+    filler_filter: Option<Arc<FillerFilter>>,
 ) {
     tokio::spawn(async move {
-        let filler_filter = if filler_enabled {
-            FillerFilter::new(&filler_words).ok()
-        } else {
-            None
-        };
         run_review_preview(
             &state,
             backend,
-            config,
+            &config,
             samples,
             overlay_tx,
-            filler_filter,
+            filler_filter.as_deref(),
             false,
         )
         .await;
     });
-}
-
-async fn schedule_review_preview(
-    preview_state: &Arc<Mutex<ReviewPreviewState>>,
-    backend: &Arc<dyn TranscriptionBackend>,
-    config: &TranscriptionConfig,
-    recording_audio: &[i16],
-    overlay_text_tx: &Option<tokio::sync::watch::Sender<String>>,
-    filler_enabled: bool,
-    filler_words: &[String],
-) {
-    let total = recording_audio.len();
-    let should = {
-        let st = preview_state.lock().await;
-        !st.in_flight && review_preview_may_run(&st, total, false)
-    };
-    if !should {
-        return;
-    }
-    spawn_review_preview(
-        Arc::clone(preview_state),
-        Arc::clone(backend),
-        config.clone(),
-        recording_audio.to_vec(),
-        overlay_text_tx.clone(),
-        filler_enabled,
-        filler_words.to_vec(),
-    );
 }
 
 async fn wait_for_review_preview(state: &Arc<Mutex<ReviewPreviewState>>) {
@@ -1511,11 +1470,11 @@ async fn run_review_streaming_pipeline(
 ) -> Result<String> {
     let notify_state = notify && !overlay_enabled;
     let pipeline_start = std::time::Instant::now();
-    let filler_filter = if filler_enabled {
-        Some(
+    let filler_filter: Option<Arc<FillerFilter>> = if filler_enabled {
+        Some(Arc::new(
             FillerFilter::new(&filler_words)
                 .context("invalid custom filler word in configuration")?,
-        )
+        ))
     } else {
         None
     };
@@ -1607,31 +1566,27 @@ async fn run_review_streaming_pipeline(
         }
 
         if auto_stop.has_speech() && !chunk_is_silent {
-            schedule_review_preview(
-                &preview_state,
-                &backend,
-                &config,
-                &recording_audio,
-                &overlay_text_tx,
-                filler_enabled,
-                &filler_words,
-            )
-            .await;
+            spawn_review_preview(
+                Arc::clone(&preview_state),
+                Arc::clone(&backend),
+                config.clone(),
+                recording_audio.clone(),
+                overlay_text_tx.clone(),
+                filler_filter.as_ref().map(Arc::clone),
+            );
         }
 
         if phrase_pause.feed(&chunk) {
             if !phrase_pause_latched && auto_stop.has_speech() {
                 phrase_pause_latched = true;
-                schedule_review_preview(
-                    &preview_state,
-                    &backend,
-                    &config,
-                    &recording_audio,
-                    &overlay_text_tx,
-                    filler_enabled,
-                    &filler_words,
-                )
-                .await;
+                spawn_review_preview(
+                    Arc::clone(&preview_state),
+                    Arc::clone(&backend),
+                    config.clone(),
+                    recording_audio.clone(),
+                    overlay_text_tx.clone(),
+                    filler_filter.as_ref().map(Arc::clone),
+                );
             }
         } else if !chunk_is_silent {
             phrase_pause_latched = false;
@@ -1644,16 +1599,14 @@ async fn run_review_streaming_pipeline(
                         > st.last_preview_samples + review_min_samples(REVIEW_MIN_NEW_AUDIO_MS)
             };
             if periodic_due {
-                schedule_review_preview(
-                    &preview_state,
-                    &backend,
-                    &config,
-                    &recording_audio,
-                    &overlay_text_tx,
-                    filler_enabled,
-                    &filler_words,
-                )
-                .await;
+                spawn_review_preview(
+                    Arc::clone(&preview_state),
+                    Arc::clone(&backend),
+                    config.clone(),
+                    recording_audio.clone(),
+                    overlay_text_tx.clone(),
+                    filler_filter.as_ref().map(Arc::clone),
+                );
             }
         }
     }
@@ -1672,10 +1625,10 @@ async fn run_review_streaming_pipeline(
             run_review_preview(
                 &preview_state,
                 Arc::clone(&backend),
-                config.clone(),
+                &config,
                 recording_audio.clone(),
                 overlay_text_tx.clone(),
-                filler_filter,
+                filler_filter.as_deref(),
                 true,
             )
             .await;
