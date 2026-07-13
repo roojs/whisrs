@@ -329,52 +329,6 @@ pub fn strip_trailing_sentence_punctuation(text: &str) -> String {
     s
 }
 
-/// Insert a missing space after sentence-ending punctuation when the next
-/// character is a word character (e.g. whisper output "Done.Now" → "Done. Now").
-pub fn normalize_sentence_spacing(text: &str) -> String {
-    const TERMINATORS: [char; 6] = ['.', '?', '!', '。', '？', '！'];
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::with_capacity(text.len() + 4);
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        out.push(c);
-        if !TERMINATORS.contains(&c) {
-            i += 1;
-            continue;
-        }
-
-        if c == '.'
-            && i > 0
-            && chars[i - 1].is_ascii_digit()
-            && i + 1 < chars.len()
-            && chars[i + 1].is_ascii_digit()
-        {
-            i += 1;
-            continue;
-        }
-
-        let mut j = i + 1;
-        while j < chars.len()
-            && matches!(chars[j], '"' | '\'' | '\u{2019}' | '\u{201D}' | ')' | ']')
-        {
-            out.push(chars[j]);
-            j += 1;
-        }
-
-        if j < chars.len() && !chars[j].is_whitespace() && chars[j].is_alphabetic() {
-            out.push(' ');
-        }
-
-        i = if j > i + 1 { j } else { i + 1 };
-    }
-    out
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     #[serde(default = "default_device")]
@@ -1042,23 +996,6 @@ mod tests {
                 state: State::Recording
             }
         ));
-    }
-
-    #[test]
-    fn normalize_sentence_spacing_inserts_missing_space() {
-        assert_eq!(
-            normalize_sentence_spacing("First sentence.Second sentence"),
-            "First sentence. Second sentence"
-        );
-        assert_eq!(
-            normalize_sentence_spacing("Done!Now we continue"),
-            "Done! Now we continue"
-        );
-    }
-
-    #[test]
-    fn normalize_sentence_spacing_preserves_decimals() {
-        assert_eq!(normalize_sentence_spacing("value is 3.14"), "value is 3.14");
     }
 
     #[test]

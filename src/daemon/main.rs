@@ -28,7 +28,7 @@ use whisrs::transcription::openai_rest::OpenAIRestBackend;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
-    encode_message, normalize_sentence_spacing, read_message, socket_path,
+    encode_message, read_message, socket_path,
     strip_trailing_sentence_punctuation, Command,
     Config, InjectorBackend, Response, State,
 };
@@ -1365,7 +1365,7 @@ async fn transcribe_recording_preview(
     if let Some(filter) = filler_filter {
         text = filter.apply(&text);
     }
-    Ok(normalize_sentence_spacing(&text))
+    Ok(text)
 }
 
 async fn run_review_preview(
@@ -1404,7 +1404,8 @@ async fn run_review_preview(
     st.in_flight = false;
     match result {
         Ok(text) if !text.trim().is_empty() => {
-            info!("review preview: {} chars ({} samples)", text.len(), total);
+            let preview = truncate_preview(&text, 120);
+            info!("review preview: {} chars ({} samples) — {preview}", text.len(), total);
             st.text = text;
             st.last_preview_samples = total;
             st.last_preview_at = std::time::Instant::now();
