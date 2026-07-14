@@ -1380,7 +1380,7 @@ async fn run_review_preview(
         st.in_flight = true;
     }
 
-    let result = async {
+    let result: Result<String> = async {
         if samples.is_empty() {
             return Ok(String::new());
         }
