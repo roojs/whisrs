@@ -1,7 +1,14 @@
 {
   "uuid": "whisrs-overlay@eresende.github",
-  "name": "whisrs Overlay",
-  "description": "Bottom-screen recording overlay for whisrs on GNOME Wayland.",
-  "shell-version": ["45", "46", "47", "48", "49"],
-  "version": 8
+  "name": "whisrs",
+  "description": "GNOME integration for whisrs: panel indicator, overlay, text injection, hotkeys, and window focus (no uinput / AppIndicator).",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49"
+  ],
+  "settings-schema": "org.gnome.shell.extensions.whisrs",
+  "version": 14
 }

@@ -181,8 +181,15 @@ pub fn run_setup() -> Result<()> {
         config_path.display()
     );
 
-    // 7. Check and optionally fix uinput permissions.
-    setup_uinput_permissions();
+    // 7. Check and optionally fix uinput permissions (skip on GNOME Shell path).
+    let skip_uinput = matches!(config.input.backend, InjectorBackend::GnomeShell)
+        || (matches!(config.input.backend, InjectorBackend::Auto)
+            && detect_compositor().as_deref() == Some("gnome"));
+    if skip_uinput {
+        println!("\n{BOLD}Skipping uinput setup{RESET} (GNOME Shell injection path).");
+    } else {
+        setup_uinput_permissions();
+    }
 
     // 8. Offer to install and enable the systemd service.
     setup_systemd_service();
@@ -241,32 +248,54 @@ pub(crate) fn select_backend(existing: Option<&Config>) -> Result<String> {
 /// uinput. The Wayland backend types layout-independently, which fixes
 /// garbled bilingual / code-switching dictation on Wayland (issue #44).
 pub(crate) fn select_injector_backend(existing: Option<&Config>) -> Result<InjectorBackend> {
-    const BACKENDS: &[InjectorBackend] = &[
-        InjectorBackend::Auto,
-        InjectorBackend::Uinput,
-        InjectorBackend::WaylandVk,
-    ];
+    let on_gnome = detect_compositor().as_deref() == Some("gnome");
+    let backends: &[InjectorBackend] = if on_gnome {
+        &[
+            InjectorBackend::Auto,
+            InjectorBackend::GnomeShell,
+            InjectorBackend::Uinput,
+            InjectorBackend::WaylandVk,
+        ]
+    } else {
+        &[
+            InjectorBackend::Auto,
+            InjectorBackend::Uinput,
+            InjectorBackend::WaylandVk,
+        ]
+    };
     let default_idx = existing
-        .map(|cfg| match cfg.input.backend {
-            InjectorBackend::Auto => 0,
-            InjectorBackend::Uinput => 1,
-            InjectorBackend::WaylandVk => 2,
+        .map(|cfg| {
+            backends
+                .iter()
+                .position(|b| *b == cfg.input.backend)
+                .unwrap_or(0)
         })
         .unwrap_or(0);
+
+    let items: Vec<&str> = if on_gnome {
+        vec![
+            "Auto         (recommended — GNOME Shell extension, else Wayland VK / uinput)",
+            "gnome-shell  (extension injection + hotkeys; no uinput / udev)",
+            "uinput       (evdev/uinput; layout-dependent on Wayland)",
+            "wayland-vk   (force zwp_virtual_keyboard_v1)",
+        ]
+    } else {
+        vec![
+            "Auto        (recommended — Wayland virtual keyboard, falls back to uinput)",
+            "uinput      (evdev/uinput; layout-dependent on Wayland)",
+            "wayland-vk  (force zwp_virtual_keyboard_v1 — fixes bilingual typing on Wayland)",
+        ]
+    };
 
     println!();
     let selection = Select::new()
         .with_prompt("Select a keyboard-injection backend")
-        .items(&[
-            "Auto        (recommended — Wayland virtual keyboard, falls back to uinput)",
-            "uinput      (evdev/uinput; layout-dependent on Wayland)",
-            "wayland-vk  (force zwp_virtual_keyboard_v1 — fixes bilingual typing on Wayland)",
-        ])
+        .items(&items)
         .default(default_idx)
         .interact()
         .context("failed to read injection backend selection")?;
 
-    Ok(BACKENDS[selection])
+    Ok(backends[selection])
 }
 
 /// Sub-menu for choosing a local transcription engine.

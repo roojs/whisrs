@@ -1,50 +1,53 @@
-# whisrs GNOME Shell overlay
+# whisrs GNOME Shell extension
 
-This extension renders the whisrs bottom recording overlay on GNOME Wayland.
-The daemon publishes recording state over the session D-Bus name
-`org.whisrs.Overlay`; the extension listens for those state changes and draws
-inside GNOME Shell.
+GNOME integration for whisrs:
 
-Install locally:
+- Bottom recording overlay (listens to `org.whisrs.Overlay`)
+- Text injection into the focused widget (`org.whisrs.Input.TypeText` — clipboard + compositor virtual keyboard)
+- Global hotkeys via the extension keybinding API (calls `org.whisrs.Control`)
+
+This path does **not** need `/dev/uinput` or udev rules.
+
+## Install locally
 
 ```bash
+EXT_DIR=~/.local/share/gnome-shell/extensions/whisrs-overlay@eresende.github
 mkdir -p ~/.local/share/gnome-shell/extensions
-cp -r contrib/gnome-shell-extension/whisrs-overlay@eresende.github \
-  ~/.local/share/gnome-shell/extensions/
+rm -rf "$EXT_DIR"
+cp -r contrib/gnome-shell-extension/whisrs-overlay@eresende.github "$EXT_DIR"
+glib-compile-schemas "$EXT_DIR/schemas"
 gnome-extensions enable whisrs-overlay@eresende.github
 ```
 
-Then set this in `~/.config/whisrs/config.toml`:
+On GNOME Wayland, log out and back in (or restart the session) so Shell reloads `extension.js`. Then:
 
 ```toml
+# ~/.config/whisrs/config.toml
 [general]
 overlay = true
+
+[input]
+backend = "gnome-shell"   # or "auto" on GNOME
+
+[hotkeys]
+toggle = "Super+Shift+W"
+cancel = "Super+Shift+D"
 ```
 
-Restart the daemon:
+Run the daemon from a build tree (no systemd / no system install):
 
 ```bash
-systemctl --user restart whisrs.service
+cargo build
+./target/debug/whisrsd
 ```
 
-If GNOME does not load the extension immediately, log out and back in, then run
-the `gnome-extensions enable` command again.
+## Updating
 
-## Updating the extension
-
-On Wayland, GNOME Shell caches extension bytecode and there is no in-session
-reload. After changing any file, clear the cache and log out:
+Clear the Shell extension cache and restart the session:
 
 ```bash
 rm -rf ~/.cache/gnome-shell/extensions/whisrs-overlay@eresende.github
+# copy files again, glib-compile-schemas, then log out/in
 ```
 
-Then log out and back in. For already-installed extensions where only
-`stylesheet.css` changed, a disable/enable cycle is sometimes enough:
-
-```bash
-gnome-extensions disable whisrs-overlay@eresende.github
-gnome-extensions enable whisrs-overlay@eresende.github
-```
-
-But for `extension.js` changes a full session restart is required.
+`stylesheet.css`-only changes sometimes reload with disable/enable; `extension.js` needs a session restart on Wayland.

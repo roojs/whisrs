@@ -74,3 +74,27 @@
 .whisrs-theme-cyan.whisrs-overlay-transcribing .whisrs-overlay-bar {
   background-color: #38bdf8;
 }
+
+/* Top-bar panel mic (replaces AppIndicator on GNOME). */
+.whisrs-panel-icon.whisrs-panel-idle {
+  color: #c0c4cc;
+}
+.whisrs-panel-icon.whisrs-panel-recording {
+  color: #e04040;
+}
+.whisrs-panel-icon.whisrs-panel-transcribing {
+  color: #e0a020;
+}
+.whisrs-panel-icon.whisrs-panel-speaking {
+  color: #34d399;
+}
+
+/* Panel hover tooltip — match gitlive-ui (shell default font, no tiny 12px). */
+.whisrs-tooltip {
+  background-color: rgba(0, 0, 0, 0.8);
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+.whisrs-tooltip StLabel {
+  color: #ffffff;
+}

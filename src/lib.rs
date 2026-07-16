@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod gnome_shell;
 pub mod history;
 pub mod hotkey;
 pub mod llm;
@@ -280,9 +281,8 @@ pub struct GeneralConfig {
     /// this setting too.
     #[serde(default)]
     pub smart_punctuation: bool,
-    /// Show an editable review dialog after dictation instead of typing live.
-    /// The dialog appears near the insert target; on confirm the final text is
-    /// pasted once. Eliminates streaming overlap/repetition issues.
+    /// Deprecated / ignored. Dictation always previews in the overlay (sliding
+    /// window + occasional full revise) and pastes once when recording stops.
     #[serde(default = "default_true")]
     pub review_before_paste: bool,
 }
@@ -361,14 +361,16 @@ pub struct AudioConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum InjectorBackend {
-    /// Use the Wayland virtual keyboard when the compositor supports
-    /// `zwp_virtual_keyboard_v1`, otherwise fall back to evdev/uinput.
+    /// Prefer GNOME Shell input when the extension is present, else Wayland
+    /// virtual keyboard when available, else evdev/uinput.
     #[default]
     Auto,
     /// Force the evdev/uinput backend (layout-dependent on Wayland).
     Uinput,
     /// Force `zwp_virtual_keyboard_v1` (errors at startup if unsupported).
     WaylandVk,
+    /// Force GNOME Shell extension injection (no `/dev/uinput`).
+    GnomeShell,
 }
 
 /// Keyboard injection (uinput) tuning.
@@ -380,10 +382,10 @@ pub struct InputConfig {
     #[serde(default = "default_key_delay_ms")]
     pub key_delay_ms: u64,
     /// Keyboard-injection backend. `auto` (the recommended default) prefers
-    /// the Wayland virtual keyboard when available and otherwise falls back
-    /// to uinput. Set this to `wayland-vk` to fix garbled bilingual /
-    /// code-switching dictation on Wayland (issue #44), where the uinput
-    /// backend can only emit characters present in the active XKB layout.
+    /// the GNOME Shell extension on GNOME, then the Wayland virtual keyboard
+    /// when available, otherwise uinput. Set `gnome-shell` to force the
+    /// extension path (no `/dev/uinput`). Set `wayland-vk` to fix garbled
+    /// bilingual / code-switching dictation on non-GNOME Wayland (issue #44).
     #[serde(default)]
     pub backend: InjectorBackend,
     /// Experimental: show provisional status at the cursor while recording
@@ -1286,6 +1288,7 @@ mod tests {
             (InjectorBackend::Auto, "auto"),
             (InjectorBackend::Uinput, "uinput"),
             (InjectorBackend::WaylandVk, "wayland-vk"),
+            (InjectorBackend::GnomeShell, "gnome-shell"),
         ] {
             #[derive(Serialize, Deserialize)]
             struct Wrap {

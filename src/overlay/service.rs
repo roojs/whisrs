@@ -229,19 +229,19 @@ pub async fn spawn_overlay(
     mut text_rx: watch::Receiver<String>,
     config: OverlayConfig,
 ) {
+    // On GNOME the Shell extension draws the pill; the daemon only broadcasts
+    // state over D-Bus. Starting the native X11/Wayland overlay too doubles UI.
     if is_gnome_desktop() {
-        let gnome_state_rx = state_rx.clone();
-        let gnome_level_rx = level_rx.clone();
-        let gnome_text_rx = text_rx.clone();
         let gnome_theme = config.theme.clone();
+        info!("overlay backend selected: GnomeShell");
         tokio::spawn(async move {
             if let Err(e) =
-                run_gnome_broadcaster(gnome_state_rx, gnome_level_rx, gnome_text_rx, gnome_theme)
-                    .await
+                run_gnome_broadcaster(state_rx, level_rx, text_rx, gnome_theme).await
             {
                 warn!("GNOME overlay D-Bus broadcaster unavailable: {e:#}");
             }
         });
+        return;
     }
 
     let (tx, rx) = mpsc::channel::<State>();

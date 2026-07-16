@@ -3,12 +3,15 @@
 //! Auto-detects the compositor at runtime and provides the appropriate backend.
 
 pub mod dbus;
+pub mod gnome_shell;
 pub mod hyprland;
 pub mod niri;
 pub mod sway;
 pub mod x11;
 
 use tracing::{info, warn};
+
+use crate::gnome_shell as gnome_shell_util;
 
 /// Trait for tracking and restoring window focus.
 pub trait WindowTracker: Send + Sync {
@@ -54,12 +57,27 @@ impl WindowTracker for NoopTracker {
 /// Auto-detect the compositor and return the appropriate `WindowTracker`.
 ///
 /// Detection order:
-/// 1. `$HYPRLAND_INSTANCE_SIGNATURE` → Hyprland
-/// 2. `$NIRI_SOCKET` → Niri
-/// 3. `$SWAYSOCK` → Sway
-/// 4. `$XDG_SESSION_TYPE == x11` → X11
-/// 5. Fallback → NoopTracker
+/// 1. GNOME Shell extension (`org.whisrs.Input`) when present
+/// 2. `$HYPRLAND_INSTANCE_SIGNATURE` → Hyprland
+/// 3. `$NIRI_SOCKET` → Niri
+/// 4. `$SWAYSOCK` → Sway
+/// 5. `$XDG_SESSION_TYPE == x11` → X11 (skipped on GNOME — use Shell)
+/// 6. Fallback → NoopTracker
 pub fn detect_tracker() -> Box<dyn WindowTracker> {
+    if gnome_shell_util::is_gnome_desktop() {
+        if let Some(tracker) = gnome_shell::GnomeShellTracker::try_new() {
+            info!("detected GNOME Shell extension for window tracking");
+            return Box::new(tracker);
+        }
+        // GNOME without the extension: do not fall through to X11 — that fights
+        // the "Shell owns the desktop" split. Type at current focus instead.
+        info!(
+            "GNOME desktop without whisrs Shell extension — window tracking disabled \
+             (stay in your target field while recording)"
+        );
+        return Box::new(NoopTracker);
+    }
+
     if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() {
         info!("detected Hyprland compositor for window tracking");
         return Box::new(hyprland::HyprlandTracker::new());
@@ -88,12 +106,10 @@ pub fn detect_tracker() -> Box<dyn WindowTracker> {
         }
     }
 
-    // GNOME / KDE on Wayland: no portable window-focus API without compositor-
-    // specific hooks. whisrs types at whatever has keyboard focus when you
-    // toggle — keep the cursor in your target field while dictating.
+    // KDE on Wayland: no portable window-focus API without compositor hooks.
     if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
         let desktop_lower = desktop.to_lowercase();
-        if desktop_lower.contains("gnome") || desktop_lower.contains("kde") {
+        if desktop_lower.contains("kde") {
             info!(
                 "detected {desktop} on Wayland — typing at current keyboard focus \
                  (no window refocus; stay in your target field while recording)"

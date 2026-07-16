@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.whisrs" path="/org/gnome/shell/extensions/whisrs/">
+    <key name="toggle" type="as">
+      <default><![CDATA[['<Super><Shift>w']]]></default>
+      <summary>Toggle recording</summary>
+    </key>
+    <key name="cancel" type="as">
+      <default><![CDATA[['<Super><Shift>d']]]></default>
+      <summary>Cancel recording</summary>
+    </key>
+    <key name="command" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Command mode</summary>
+    </key>
+    <key name="speak" type="as">
+      <default><![CDATA[[]]]></default>
+      <summary>Read selection aloud</summary>
+    </key>
+  </schema>
+</schemalist>

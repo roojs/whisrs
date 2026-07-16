@@ -308,14 +308,13 @@ async fn process_stream_window(
     committed: &mut String,
     text_tx: &mpsc::Sender<String>,
     omit_initial_prompt: bool,
-    review_before_paste: bool,
 ) {
     if audio_silence_gate::is_silent(window, INFERENCE_SILENCE_THRESHOLD) {
         return;
     }
 
     let samples_f32 = i16_to_f32(window);
-    let prev_prompt = if review_before_paste || omit_initial_prompt || committed.is_empty() {
+    let prev_prompt = if omit_initial_prompt || committed.is_empty() {
         None
     } else {
         let tail = prompt_tail(committed, PROMPT_TAIL_WORDS);
@@ -337,11 +336,6 @@ async fn process_stream_window(
         Ok(full_text) => {
             let trimmed = full_text.trim();
             if trimmed.is_empty() {
-                return;
-            }
-            if review_before_paste {
-                debug!("review preview window: {:?}", trimmed);
-                text_tx.send(trimmed.to_string()).await.ok();
                 return;
             }
             let new_text = dedup_window_text(committed, trimmed);
@@ -411,7 +405,6 @@ impl TranscriptionBackend for LocalWhisperBackend {
         // Committed transcript fed back as initial_prompt tail for the next window.
         let mut committed = config.prompt.clone().unwrap_or_default();
         let mut speech_started = false;
-        let review_before_paste = config.review_before_paste;
 
         while let Some(chunk) = audio_rx.recv().await {
             if !speech_started && !audio_silence_gate::is_silent(&chunk, audio_silence_gate::SILENCE_RMS_THRESHOLD) {
@@ -457,7 +450,6 @@ impl TranscriptionBackend for LocalWhisperBackend {
                         &mut committed,
                         &text_tx,
                         omit_prompt,
-                        review_before_paste,
                     )
                     .await;
                 }
@@ -483,7 +475,6 @@ impl TranscriptionBackend for LocalWhisperBackend {
                 &mut committed,
                 &text_tx,
                 false,
-                review_before_paste,
             )
             .await;
         }
