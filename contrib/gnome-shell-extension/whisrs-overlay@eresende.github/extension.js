@@ -190,7 +190,9 @@ export default class WhisrsOverlayExtension extends Extension {
         );
 
         this._exportInputBus();
+        this._daemonRunning = false;
         this._watchControlBus();
+        this._probeDaemon();
         this._syncHotkeysFromDaemon();
         this._registerKeybindings();
         this._createPanelIndicator();
@@ -207,6 +209,7 @@ export default class WhisrsOverlayExtension extends Extension {
 
         this._position();
         this._updatePanelIndicator('idle');
+        this._updateDaemonPresenceUi();
     }
 
     disable() {
@@ -378,6 +381,7 @@ export default class WhisrsOverlayExtension extends Extension {
                 speak: '',
             };
             this._panelState = this._panelState || 'idle';
+            this._seedHotkeyLabelsFromSettings();
 
             this._indicator = new PanelMenu.Button(0.0, 'whisrs', false);
             this._panelIcon = new St.Icon({
@@ -389,6 +393,10 @@ export default class WhisrsOverlayExtension extends Extension {
             // Left-click toggles; right-click opens the menu.
             this._indicator.connect('button-press-event', (_actor, event) => {
                 if (event.get_button() === 1) {
+                    if (!this._daemonRunning) {
+                        this._showPanelTooltip();
+                        return Clutter.EVENT_STOP;
+                    }
                     this._callControl('Toggle');
                     return Clutter.EVENT_STOP;
                 }
@@ -441,7 +449,11 @@ export default class WhisrsOverlayExtension extends Extension {
     }
 
     _panelTooltipText() {
-        const toggle = (this._hotkeyLabels?.toggle || '').trim();
+        if (!this._daemonRunning) {
+            return 'whisrs — daemon not running\nStart whisrsd, then try again';
+        }
+
+        const toggle = this._formatHotkeyDisplay(this._toggleShortcutLabel());
         const state = String(this._panelState || 'idle').toLowerCase();
 
         if (state === 'recording') {
@@ -459,6 +471,63 @@ export default class WhisrsOverlayExtension extends Extension {
             : 'whisrs\nClick to start';
     }
 
+    /** Prefer daemon hotkey label; fall back to GSettings accel. */
+    _toggleShortcutLabel() {
+        const fromDaemon = (this._hotkeyLabels?.toggle || '').trim();
+        if (fromDaemon)
+            return fromDaemon;
+        return this._shortcutFromSettings('toggle');
+    }
+
+    _shortcutFromSettings(name) {
+        const accel = this._settings?.get_strv(name)?.[0];
+        if (!accel || !String(accel).trim())
+            return '';
+        return this._fromGnomeAccel(accel);
+    }
+
+    /** Seed labels from GSettings so tooltips work before/without daemon sync. */
+    _seedHotkeyLabelsFromSettings() {
+        this._hotkeyLabels = this._hotkeyLabels || {
+            toggle: '',
+            cancel: '',
+            command: '',
+            speak: '',
+        };
+        for (const name of HOTKEY_ACTIONS) {
+            if ((this._hotkeyLabels[name] || '').trim())
+                continue;
+            const fromSettings = this._shortcutFromSettings(name);
+            if (fromSettings)
+                this._hotkeyLabels[name] = fromSettings;
+        }
+    }
+
+    /** `Ctrl+Alt+W` → `Ctrl + Alt + W` (readable tooltip / menu). */
+    _formatHotkeyDisplay(binding) {
+        if (!binding || !String(binding).trim())
+            return '';
+        return String(binding)
+            .split('+')
+            .map(part => {
+                const p = part.trim();
+                const lower = p.toLowerCase();
+                if (lower === 'ctrl' || lower === 'control')
+                    return 'Ctrl';
+                if (lower === 'alt' || lower === 'mod1')
+                    return 'Alt';
+                if (lower === 'shift')
+                    return 'Shift';
+                if (lower === 'super' || lower === 'meta' || lower === 'mod4' || lower === 'win')
+                    return 'Super';
+                if (p.length === 1)
+                    return p.toUpperCase();
+                return p;
+            })
+            .filter(Boolean)
+            .join(' + ');
+    }
+
     _updatePanelTooltip() {
         if (!this._panelTooltipLabel)
             return;
@@ -468,6 +537,8 @@ export default class WhisrsOverlayExtension extends Extension {
     _showPanelTooltip() {
         if (!this._panelTooltip || !this._indicator)
             return;
+        // Labels may arrive late from the daemon; refresh from settings too.
+        this._seedHotkeyLabelsFromSettings();
         this._updatePanelTooltip();
         const [x, y] = this._indicator.get_transformed_position();
         const [, height] = this._indicator.get_transformed_size();
@@ -494,13 +565,26 @@ export default class WhisrsOverlayExtension extends Extension {
 
         this._indicator.menu.removeAll();
 
-        const header = new PopupMenu.PopupMenuItem('whisrs', {
+        const headerLabel = this._daemonRunning
+            ? 'whisrs'
+            : 'whisrs — daemon not running';
+        const header = new PopupMenu.PopupMenuItem(headerLabel, {
             reactive: false,
             can_focus: false,
         });
         header.setSensitive(false);
         this._indicator.menu.addMenuItem(header);
         this._indicator.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        if (!this._daemonRunning) {
+            const hint = new PopupMenu.PopupMenuItem('Start whisrsd to enable dictation', {
+                reactive: false,
+                can_focus: false,
+            });
+            hint.setSensitive(false);
+            this._indicator.menu.addMenuItem(hint);
+            return;
+        }
 
         const labels = this._hotkeyLabels || {};
 
@@ -561,8 +645,14 @@ export default class WhisrsOverlayExtension extends Extension {
             'whisrs-panel-recording',
             'whisrs-panel-transcribing',
             'whisrs-panel-speaking',
+            'whisrs-panel-offline',
         ])
             this._panelIcon.remove_style_class_name(cls);
+
+        if (!this._daemonRunning) {
+            this._panelIcon.add_style_class_name('whisrs-panel-offline');
+            return;
+        }
 
         if (normalized === 'recording')
             this._panelIcon.add_style_class_name('whisrs-panel-recording');
@@ -572,6 +662,44 @@ export default class WhisrsOverlayExtension extends Extension {
             this._panelIcon.add_style_class_name('whisrs-panel-speaking');
         else
             this._panelIcon.add_style_class_name('whisrs-panel-idle');
+    }
+
+    _setDaemonRunning(running) {
+        const next = !!running;
+        if (this._daemonRunning === next)
+            return;
+        this._daemonRunning = next;
+        this._updateDaemonPresenceUi();
+        if (next)
+            this._syncHotkeysFromDaemon();
+    }
+
+    _updateDaemonPresenceUi() {
+        this._updatePanelIndicator(this._panelState || 'idle');
+        this._rebuildPanelMenu();
+        this._updatePanelTooltip();
+    }
+
+    _probeDaemon() {
+        Gio.DBus.session.call(
+            'org.freedesktop.DBus',
+            '/org/freedesktop/DBus',
+            'org.freedesktop.DBus',
+            'NameHasOwner',
+            new GLib.Variant('(s)', [CONTROL_DEST]),
+            new GLib.VariantType('(b)'),
+            Gio.DBusCallFlags.NONE,
+            2000,
+            null,
+            (conn, result) => {
+                try {
+                    const [hasOwner] = conn.call_finish(result).deep_unpack();
+                    this._setDaemonRunning(!!hasOwner);
+                } catch (_e) {
+                    this._setDaemonRunning(false);
+                }
+            }
+        );
     }
 
     _pasteText(text) {
@@ -645,8 +773,7 @@ export default class WhisrsOverlayExtension extends Extension {
             Gio.DBusSignalFlags.NONE,
             (_c, _s, _p, _i, _sig, parameters) => {
                 const [, , newOwner] = parameters.deep_unpack();
-                if (newOwner)
-                    this._syncHotkeysFromDaemon();
+                this._setDaemonRunning(!!newOwner);
             }
         );
     }
@@ -670,11 +797,12 @@ export default class WhisrsOverlayExtension extends Extension {
                         GLib.source_remove(this._hotkeyRetryId);
                         this._hotkeyRetryId = 0;
                     }
+                    this._setDaemonRunning(true);
                     this._hotkeyLabels = {
-                        toggle: toggle || '',
-                        cancel: cancel || '',
-                        command: command || '',
-                        speak: speak || '',
+                        toggle: toggle || this._shortcutFromSettings('toggle') || '',
+                        cancel: cancel || this._shortcutFromSettings('cancel') || '',
+                        command: command || this._shortcutFromSettings('command') || '',
+                        speak: speak || this._shortcutFromSettings('speak') || '',
                     };
                     this._applyHotkeySetting('toggle', toggle);
                     this._applyHotkeySetting('cancel', cancel);
@@ -684,7 +812,10 @@ export default class WhisrsOverlayExtension extends Extension {
                     this._rebuildPanelMenu();
                     this._updatePanelTooltip();
                 } catch (_e) {
-                    // Daemon not up yet — retry a few times.
+                    // Daemon not up yet — keep GSettings labels and retry.
+                    this._setDaemonRunning(false);
+                    this._seedHotkeyLabelsFromSettings();
+                    this._updatePanelTooltip();
                     if (!this._hotkeyRetryId) {
                         let tries = 0;
                         this._hotkeyRetryId = GLib.timeout_add_seconds(
@@ -707,7 +838,12 @@ export default class WhisrsOverlayExtension extends Extension {
     _applyHotkeySetting(name, whisrsBinding) {
         if (!this._settings)
             return;
+        // Never wipe a working GSettings binding with an empty daemon value.
+        if (!whisrsBinding || !String(whisrsBinding).trim())
+            return;
         const accel = this._toGnomeAccel(whisrsBinding);
+        if (accel.length === 0)
+            return;
         this._settings.set_strv(name, accel);
     }
 
@@ -734,6 +870,26 @@ export default class WhisrsOverlayExtension extends Extension {
         }
         const keyOut = key.length === 1 ? key.toLowerCase() : key;
         return [`${accel}${keyOut}`];
+    }
+
+    /** `<Control><Alt>w` → `Ctrl+Alt+W` */
+    _fromGnomeAccel(accel) {
+        if (!accel || !String(accel).trim())
+            return '';
+        const s = String(accel);
+        const parts = [];
+        if (s.includes('<Control>') || s.includes('<Primary>'))
+            parts.push('Ctrl');
+        if (s.includes('<Alt>'))
+            parts.push('Alt');
+        if (s.includes('<Shift>'))
+            parts.push('Shift');
+        if (s.includes('<Super>') || s.includes('<Meta>'))
+            parts.push('Super');
+        const key = s.replace(/<[^>]+>/g, '').trim();
+        if (key)
+            parts.push(key.length === 1 ? key.toUpperCase() : key);
+        return parts.join('+');
     }
 
     _registerKeybindings() {

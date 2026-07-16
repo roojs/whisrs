@@ -2,9 +2,10 @@
 //!
 //! Uses whisper-rs with a sliding window approach for pseudo-streaming.
 //!
-//! Live typing mode: each window is deduplicated against committed text and
-//! only novel suffixes are emitted. Review/overlay mode uses full-audio
-//! re-transcription in the daemon instead of this streaming path.
+//! Live typing / overlay mode: each decode uses the **latest** audio edge
+//! (never walks a backlog of intermediate steps). Silence gaps **seal** the
+//! cursor so older audio is not re-interpreted; new speech after a pause is
+//! decoded fresh with only a short `initial_prompt` tail for continuity.
 
 use std::sync::Arc;
 
@@ -38,8 +39,12 @@ const NO_SPEECH_SEGMENT_THRESHOLD: f32 = 0.50;
 const PROMPT_TAIL_WORDS: usize = 20;
 
 /// Skip `initial_prompt` after this many consecutive silent inference windows
-/// (~1 s each) so whisper does not regurgitate stale context after a pause.
+/// so whisper does not regurgitate stale context after a pause.
 const SILENT_SKIPS_BEFORE_OMIT_PROMPT: u32 = 2;
+
+/// After this many consecutive silent latest-windows, seal the stream cursor
+/// so sealed audio is never re-decoded (focus on what comes next).
+const SEAL_AFTER_SILENT_SKIPS: u32 = 2;
 
 struct StreamInferJob {
     samples: Vec<f32>,
@@ -399,84 +404,131 @@ impl TranscriptionBackend for LocalWhisperBackend {
         let infer_tx = start_stream_infer_thread(Arc::clone(ctx))?;
 
         let mut buffer: Vec<i16> = Vec::new();
-        let mut next_process_at = INITIAL_WINDOW_SAMPLES;
         let mut last_processed_end: usize = 0;
+        // Sample index at/before which audio is sealed (not re-decoded).
+        let mut sealed_until: usize = 0;
         let mut consecutive_silent_skips: u32 = 0;
         // Committed transcript fed back as initial_prompt tail for the next window.
         let mut committed = config.prompt.clone().unwrap_or_default();
         let mut speech_started = false;
 
         while let Some(chunk) = audio_rx.recv().await {
-            if !speech_started && !audio_silence_gate::is_silent(&chunk, audio_silence_gate::SILENCE_RMS_THRESHOLD) {
+            if !speech_started
+                && !audio_silence_gate::is_silent(&chunk, audio_silence_gate::SILENCE_RMS_THRESHOLD)
+            {
                 speech_started = true;
             }
             buffer.extend_from_slice(&chunk);
 
-            while buffer.len() >= next_process_at {
-                if !speech_started {
-                    debug!(
-                        "leading silence — skipping inference until speech (at sample {})",
-                        next_process_at
-                    );
-                    last_processed_end = next_process_at;
-                    next_process_at += STEP_SAMPLES;
-                    continue;
-                }
-
-                let window_size = if last_processed_end == 0 {
-                    INITIAL_WINDOW_SAMPLES.min(buffer.len())
-                } else {
-                    WINDOW_SAMPLES.min(buffer.len())
-                };
-
-                let window_end = next_process_at;
-                let window_start = window_end.saturating_sub(window_size);
-                let window = buffer[window_start..window_end].to_vec();
-
-                if audio_silence_gate::is_silent(&window, INFERENCE_SILENCE_THRESHOLD) {
-                    debug!(
-                        "skipping silent window at samples {}..{}",
-                        window_start, window_end
-                    );
-                    consecutive_silent_skips += 1;
-                } else {
-                    let omit_prompt =
-                        consecutive_silent_skips >= SILENT_SKIPS_BEFORE_OMIT_PROMPT;
-                    consecutive_silent_skips = 0;
-                    process_stream_window(
-                        &infer_tx,
-                        &window,
-                        &config.language,
-                        &mut committed,
-                        &text_tx,
-                        omit_prompt,
+            // Absorb whatever arrived while we were busy — always decode the
+            // live edge, never a queue of intermediate 1s steps.
+            while let Ok(more) = audio_rx.try_recv() {
+                if !speech_started
+                    && !audio_silence_gate::is_silent(
+                        &more,
+                        audio_silence_gate::SILENCE_RMS_THRESHOLD,
                     )
-                    .await;
+                {
+                    speech_started = true;
                 }
-
-                last_processed_end = window_end;
-                next_process_at += STEP_SAMPLES;
+                buffer.extend_from_slice(&more);
             }
+
+            if !speech_started {
+                last_processed_end = buffer.len();
+                continue;
+            }
+
+            let live_end = (buffer.len() / STEP_SAMPLES) * STEP_SAMPLES;
+            if live_end < INITIAL_WINDOW_SAMPLES {
+                continue;
+            }
+            // Wait for at least one step of new audio since the last decode.
+            if live_end < last_processed_end.saturating_add(STEP_SAMPLES) {
+                continue;
+            }
+
+            let first_window = last_processed_end < INITIAL_WINDOW_SAMPLES;
+            let window_size = if first_window {
+                INITIAL_WINDOW_SAMPLES.min(live_end)
+            } else {
+                WINDOW_SAMPLES.min(live_end)
+            };
+            let window_end = live_end;
+            // Never re-decode sealed audio; after a gap, focus on what follows.
+            let window_start = window_end.saturating_sub(window_size).max(sealed_until);
+            if window_end <= window_start {
+                last_processed_end = window_end;
+                continue;
+            }
+
+            let skipped = window_end.saturating_sub(last_processed_end.max(STEP_SAMPLES));
+            if skipped > STEP_SAMPLES {
+                debug!(
+                    "stream catch-up: jumping to live edge (skipped ~{} ms of intermediate windows)",
+                    (skipped.saturating_sub(STEP_SAMPLES) * 1000) / SAMPLE_RATE
+                );
+            }
+
+            let window = buffer[window_start..window_end].to_vec();
+
+            if audio_silence_gate::is_silent(&window, INFERENCE_SILENCE_THRESHOLD) {
+                debug!(
+                    "skipping silent window at samples {}..{}",
+                    window_start, window_end
+                );
+                consecutive_silent_skips += 1;
+                last_processed_end = window_end;
+                if consecutive_silent_skips >= SEAL_AFTER_SILENT_SKIPS
+                    && window_end > sealed_until
+                {
+                    sealed_until = window_end;
+                    info!(
+                        "stream sealed at {sealed_until} samples after silence gap — committed {} chars",
+                        committed.len()
+                    );
+                }
+                continue;
+            }
+
+            let omit_prompt =
+                consecutive_silent_skips >= SILENT_SKIPS_BEFORE_OMIT_PROMPT;
+            consecutive_silent_skips = 0;
+
+            process_stream_window(
+                &infer_tx,
+                &window,
+                &config.language,
+                &mut committed,
+                &text_tx,
+                omit_prompt,
+            )
+            .await;
+
+            last_processed_end = window_end;
         }
 
         // Process remaining audio not covered by the last window.
         if buffer.len() > last_processed_end {
             let remaining_start = if buffer.len() - last_processed_end < SAMPLE_RATE {
-                last_processed_end.saturating_sub(WINDOW_SAMPLES / 4)
-            } else {
                 last_processed_end
+                    .saturating_sub(WINDOW_SAMPLES / 4)
+                    .max(sealed_until)
+            } else {
+                last_processed_end.max(sealed_until)
             };
-            let remaining = buffer[remaining_start..].to_vec();
-
-            process_stream_window(
-                &infer_tx,
-                &remaining,
-                &config.language,
-                &mut committed,
-                &text_tx,
-                false,
-            )
-            .await;
+            if remaining_start < buffer.len() {
+                let remaining = buffer[remaining_start..].to_vec();
+                process_stream_window(
+                    &infer_tx,
+                    &remaining,
+                    &config.language,
+                    &mut committed,
+                    &text_tx,
+                    false,
+                )
+                .await;
+            }
         }
 
         Ok(())

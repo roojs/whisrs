@@ -88,6 +88,10 @@
 .whisrs-panel-icon.whisrs-panel-speaking {
   color: #34d399;
 }
+.whisrs-panel-icon.whisrs-panel-offline {
+  color: #6b7280;
+  opacity: 0.55;
+}
 
 /* Panel hover tooltip — match gitlive-ui (shell default font, no tiny 12px). */
 .whisrs-tooltip {

@@ -36,8 +36,9 @@ use whisrs::{
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
 const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Phrase pause (ms) that may trigger an occasional full-audio revise.
-/// Live overlay text comes from sliding windows; revises only clean up.
+/// Phrase pause (ms) reserved for a future light mid-stream clean pass.
+/// Mid-recording full-audio revise is currently disabled (starves live slides).
+#[allow(dead_code)]
 const REVIEW_PHRASE_PAUSE_MS: u64 = 900;
 /// Minimum time between mid-recording full revises (keep them rare).
 const REVIEW_MIN_PREVIEW_INTERVAL_MS: u64 = 5000;
@@ -1489,14 +1490,10 @@ async fn run_streaming_pipeline(
 
     let mut auto_stop =
         AutoStopDetector::new(SILENCE_RMS_THRESHOLD, silence_timeout_ms, SAMPLE_RATE);
-    let mut phrase_pause =
-        AutoStopDetector::new(SILENCE_RMS_THRESHOLD, REVIEW_PHRASE_PAUSE_MS, SAMPLE_RATE);
-    let mut phrase_pause_latched = false;
     let mut recording_audio: Vec<i16> = Vec::new();
 
     while let Some(chunk) = audio_rx.recv().await {
         recording_audio.extend_from_slice(&chunk);
-        let chunk_is_silent = audio_silence_gate::is_silent(&chunk, SILENCE_RMS_THRESHOLD);
 
         if auto_stop.feed(&chunk) {
             info!("silence auto-stop triggered after {silence_timeout_ms}ms");
@@ -1518,32 +1515,10 @@ async fn run_streaming_pipeline(
             break;
         }
 
-        // Occasional full-audio revise on phrase pause only — never while
-        // actively speaking (periodic full ASR starved sliding-window updates
-        // and made stop hang for the whole recording).
-        if phrase_pause.feed(&chunk) {
-            if !phrase_pause_latched && auto_stop.has_speech() {
-                phrase_pause_latched = true;
-                let due = {
-                    let st = revise_state.lock().await;
-                    !st.in_flight && review_preview_may_run(&st, recording_audio.len())
-                };
-                if due {
-                    spawn_overlay_full_revise(
-                        Arc::clone(&revise_state),
-                        Arc::clone(&draft),
-                        Arc::clone(&backend),
-                        config.clone(),
-                        recording_audio.clone(),
-                        overlay_text_tx.clone(),
-                        filler_filter.clone(),
-                        false,
-                    );
-                }
-            }
-        } else if !chunk_is_silent {
-            phrase_pause_latched = false;
-        }
+        // Mid-recording full-audio revise is intentionally off while streaming:
+        // it re-runs whisper on the whole buffer and starves live-edge slides
+        // (growing delay). Sealing + catch-up in local_whisper handles gaps;
+        // one bounded final revise still runs at stop for paste.
 
         if audio_tx.send(chunk).await.is_err() {
             break;
@@ -1666,31 +1641,6 @@ async fn run_streaming_pipeline(
     }
 
     Ok(full_text)
-}
-
-fn spawn_overlay_full_revise(
-    revise_state: Arc<Mutex<ReviewPreviewState>>,
-    draft: Arc<Mutex<String>>,
-    backend: Arc<dyn TranscriptionBackend>,
-    config: TranscriptionConfig,
-    samples: Vec<i16>,
-    overlay_tx: Option<tokio::sync::watch::Sender<String>>,
-    filler_filter: Option<Arc<FillerFilter>>,
-    force: bool,
-) {
-    tokio::spawn(async move {
-        run_overlay_full_revise(
-            &revise_state,
-            &draft,
-            backend,
-            &config,
-            samples,
-            overlay_tx,
-            filler_filter.as_deref(),
-            force,
-        )
-        .await;
-    });
 }
 
 async fn run_overlay_full_revise(
